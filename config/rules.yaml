@@ -1,0 +1,32 @@
+termination:
+  min_sessions: 10
+  min_events: 3
+  min_rate: 0.2
+  weight: 30
+automation:
+  min_sessions: 10
+  max_input_cv: 0.05
+  max_duration_cv: 0.05
+  weight: 30
+diversity:
+  min_sessions: 10
+  min_daily_devices: 3
+  min_daily_countries: 3
+  single_weight: 10
+  both_weight: 25
+coordination:
+  min_other_device_users: 2
+  min_other_payment_users: 2
+  weight: 10
+  max_age_days: 14
+  young_bonus: 15
+payment:
+  min_attempts: 5
+  min_failures: 3
+  min_rate: 0.5
+  weight: 5
+shared_ip:
+  min_other_users: 10
+  weight: 0
+review:
+  min_score: 25

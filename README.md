@@ -197,3 +197,9 @@ Thresholds will be selected after inspecting the generated data.
 Evaluation will examine false positives, missed abuse, and innocent
 shared-IP users. Ground-truth labels will remain separate from the
 features used by the detectors.
+
+
+## features.py
+
+This file takes the sessions csv and turnign tonto apanda datafram useing hashmap and O(1) look u ptome to see what needed to be added and what next the row output by this file for each of the user if wil include userid, session count, distinct devices, distinct_ips, distinct_countries, termination count, termination rate, mean_session length, standard deviation in druation, mean input rate, standard deviation in input rate
+
