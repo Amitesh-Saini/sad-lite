@@ -84,11 +84,19 @@ def validate_user_ids(data, file_name):
         raise ValueError(f"{file_name} contains duplicate user IDs")
 
 
-def load_scores(path):
-    """Load and validate the saved rule scores."""
+def load_scores(path, score_column="rule_score"):
+    """Load and validate saved rule scores or model anomaly scores."""
+
+    if score_column not in ["rule_score", "anomaly_score"]:
+        raise ValueError("score_column must be 'rule_score' or 'anomaly_score'")
 
     scores = pd.read_csv(path, dtype={"user_id": "string"})
-    required = {"user_id", "rank", "rule_score", "review_recommended"}
+    required = {"user_id", "rank", score_column}
+
+    # Only the rules currently have a saved review threshold.
+    if score_column == "rule_score":
+        required.add("review_recommended")
+
     missing = required - set(scores.columns)
 
     if missing:
@@ -99,14 +107,15 @@ def load_scores(path):
     if {"label", "pattern"} & set(scores.columns):
         raise ValueError("Score file must not contain ground-truth labels")
 
-    for column in ["rank", "rule_score"]:
+    for column in ["rank", score_column]:
         scores[column] = pd.to_numeric(scores[column], errors="raise")
 
         if not np.isfinite(scores[column]).all():
             raise ValueError(f"{column} contains missing or infinite values")
 
-    if scores["rule_score"].lt(0).any():
-        raise ValueError("Rule scores must be nonnegative")
+    # Both scoring methods currently produce nonnegative scores.
+    if scores[score_column].lt(0).any():
+        raise ValueError(f"{score_column} must be nonnegative")
 
     # Ranks must be whole numbers from 1 to the number of accounts.
     if (scores["rank"] % 1 != 0).any():
@@ -116,27 +125,30 @@ def load_scores(path):
         raise ValueError("Ranks must be unique and consecutive, starting at 1")
 
     scores["rank"] = scores["rank"].astype(int)
-
-    # Convert explicitly; astype(bool) would treat the string 'False' as True.
-    decisions = scores["review_recommended"].astype("string").str.strip().str.lower()
-
-    if decisions.isna().any() or not decisions.isin(["true", "false"]).all():
-        raise ValueError("review_recommended must contain only True or False")
-
-    scores["review_recommended"] = decisions.map({"true": True, "false": False}).astype(bool)
     scores = scores.sort_values("rank").reset_index(drop=True)
 
-    if not scores["rule_score"].is_monotonic_decreasing:
-        raise ValueError("Ranking does not follow descending rule scores")
+    if not scores[score_column].is_monotonic_decreasing:
+        raise ValueError(f"Ranking does not follow descending {score_column}")
 
-    # Equal scores should have the same saved threshold decision.
-    if scores.groupby("rule_score")["review_recommended"].nunique().gt(1).any():
-        raise ValueError("Accounts with equal scores have inconsistent review decisions")
+    # Validate threshold decisions only for the rules.
+    if score_column == "rule_score":
+        decisions = scores["review_recommended"].astype("string").str.strip().str.lower()
 
-    decisions_by_score = scores.groupby("rule_score")["review_recommended"].first()
+        if decisions.isna().any() or not decisions.isin(["true", "false"]).all():
+            raise ValueError("review_recommended must contain only True or False")
 
-    if not decisions_by_score.is_monotonic_increasing:
-        raise ValueError("Review decisions are inconsistent with a score threshold")
+        scores["review_recommended"] = decisions.map({"true": True, "false": False}).astype(bool)
+
+        if scores.groupby(score_column)["review_recommended"].nunique().gt(1).any():
+            raise ValueError("Accounts with equal scores have inconsistent review decisions")
+
+        decisions_by_score = scores.groupby(score_column)["review_recommended"].first()
+
+        if not decisions_by_score.is_monotonic_increasing:
+            raise ValueError("Review decisions are inconsistent with a score threshold")
+
+    elif "review_recommended" in scores.columns:
+        raise ValueError("Model scores should contain rankings only; no review cutoff has been defined")
 
     return scores
 
@@ -166,32 +178,37 @@ def load_labels(path):
     return labels[["user_id", "label", "pattern"]].copy()
 
 
-def load_evaluation_data(scores_path, labels_path):
-    """Load both files and match predictions with labels by account ID."""
+def load_evaluation_data(scores_path, labels_path, score_column="rule_score"):
+    """Load scores and join each account with its ground-truth label."""
 
-    scores = load_scores(scores_path)
+    scores = load_scores(scores_path, score_column=score_column)
     labels = load_labels(labels_path)
 
+    # Both files must describe exactly the same accounts.
     score_ids = set(scores["user_id"])
     label_ids = set(labels["user_id"])
 
-    missing_predictions = label_ids - score_ids
     missing_labels = score_ids - label_ids
+    missing_scores = label_ids - score_ids
 
-    if missing_predictions or missing_labels:
-        raise ValueError(
-            f"Account coverage mismatch: {len(missing_predictions)} accounts lack predictions; "
-            f"{len(missing_labels)} accounts lack labels"
-        )
+    if missing_labels:
+        raise ValueError(f"Accounts missing labels: {sorted(missing_labels)}")
 
-    # One-to-one prevents duplicate IDs from multiplying rows during the join.
+    if missing_scores:
+        raise ValueError(f"Accounts missing scores: {sorted(missing_scores)}")
+
+    # Join by user ID, not row position.
     data = scores.merge(labels, on="user_id", how="inner", validate="one_to_one")
+    data = data.sort_values("rank").reset_index(drop=True)
 
-    return data.sort_values("rank").reset_index(drop=True)
+    return data
 
 
 def count_outcomes(data):
     """Count correct and incorrect review decisions against known labels."""
+
+    if "review_recommended" not in data.columns:
+        raise ValueError("Review decisions must be defined before counting outcomes.")
 
     tp = 0
     fp = 0
@@ -238,8 +255,29 @@ def calculate_metrics(outcomes):
         "false_positive_rate": false_positive_rate,
     }
 
+def evaluate_at_budget(data, k):
+    """Evaluate decisions where exactly the top k accounts receive review."""
+
+    top_k_result = evaluate_top_k(data, k)
+
+    # Work on a copy so the original rules threshold decisions stay unchanged.
+    decisions = data.copy()
+    selected_ids = top_k_result["accounts"]["user_id"]
+
+    decisions["review_recommended"] = decisions["user_id"].isin(selected_ids)
+
+    outcomes = count_outcomes(decisions)
+    metrics = calculate_metrics(outcomes)
+
+    return {
+        "k": k,
+        "outcomes": outcomes,
+        "metrics": metrics,
+        "accounts": decisions,
+    }
+
 def evaluate_top_k(data, k):
-    """Evaluate the first k accounts in the saved suspiciousness ranking."""
+    """Evaluate the top k accounts from either the rules or model ranking."""
 
     if isinstance(k, bool) or not isinstance(k, int):
         raise ValueError("k must be an integer")
@@ -254,7 +292,10 @@ def evaluate_top_k(data, k):
     innocent_found = k - abusive_found
     total_abusive = int(data["label"].sum())
 
+    # Precision: how many reviewed accounts are abusive?
     precision = abusive_found / k
+
+    # Recall: how much of the dataset's abuse did this review budget find?
     recall = abusive_found / total_abusive if total_abusive > 0 else None
 
     return {
@@ -265,197 +306,264 @@ def evaluate_top_k(data, k):
         "recall": recall,
         "accounts": top_accounts,
     }
-
-def calculate_average_precision(data):
-    """Measure how well scores rank abusive accounts above innocent ones."""
+def calculate_average_precision(data, score_column="rule_score"):
+    """Measure ranking quality using either rule scores or anomaly scores."""
 
     if data.empty:
-        raise ValueError("Cannot evaluate an empty dataset")
+        raise ValueError("Cannot evaluate an empty account table.")
 
-    # Without abusive accounts, average precision is undefined.
+    if score_column not in data.columns:
+        raise ValueError(f"Missing score column: {score_column}")
+
     if data["label"].sum() == 0:
         return None
 
-    return float(average_precision_score(data["label"], data["rule_score"]))
+    # Use scores directly so tied scores are evaluated together.
+    return float(average_precision_score(data["label"], data[score_column]))
 
-def calculate_scenario_breakdowns(data):
-    """Calculate detection results separately for each generated scenario."""
+def calculate_scenario_breakdowns(data, k=None):
+    """Evaluate review decisions separately for each scenario."""
 
     if data.empty:
-        raise ValueError("Cannot evaluate an empty dataset")
+        raise ValueError("Cannot evaluate an empty account table.")
+
+    if "pattern" not in data.columns:
+        raise ValueError("Evaluation data must contain scenario names.")
+
+    if data["pattern"].isna().any():
+        raise ValueError("Scenario names must not be missing.")
+
+    # Select the top k across all accounts before grouping by scenario.
+    if k is not None:
+        evaluation = evaluate_at_budget(data, k)
+        decisions = evaluation["accounts"]
+    else:
+        if "review_recommended" not in data.columns:
+            raise ValueError("Provide k when saved review decisions are unavailable.")
+
+        decisions = data.copy()
 
     rows = []
 
-    for pattern, group in data.groupby("pattern", sort=True):
-        outcomes = count_outcomes(group)
+    for pattern, accounts in decisions.groupby("pattern", sort=True):
+        outcomes = count_outcomes(accounts)
         metrics = calculate_metrics(outcomes)
 
-        rows.append({
+        row = {
             "pattern": pattern,
-            "account_count": len(group),
-            "abusive_count": outcomes["TP"] + outcomes["FN"],
-            "innocent_count": outcomes["FP"] + outcomes["TN"],
-            "review_count": outcomes["TP"] + outcomes["FP"],
-            "TP": outcomes["TP"],
-            "FP": outcomes["FP"],
-            "FN": outcomes["FN"],
-            "TN": outcomes["TN"],
+            "account_count": len(accounts),
+            "abusive_count": int(accounts["label"].eq(1).sum()),
+            "innocent_count": int(accounts["label"].eq(0).sum()),
+            "review_count": int(accounts["review_recommended"].sum()),
+            **outcomes,
             **metrics,
-        })
+        }
+
+        rows.append(row)
 
     return pd.DataFrame(rows)
-def save_reports(data, outcomes, metrics, average_precision, top_k_results, scenario_breakdowns, output_dir):
-    """Save one evaluation run in a new folder without overwriting past runs."""
+
+def save_reports(results, comparison, overlap, output_dir):
+    """Save rules and model evaluations in a new report folder."""
 
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=False)
 
-    # JSON stores overall metrics. Undefined values become null.
-    overall = {
-        "account_count": len(data),
-        "review_count": outcomes["TP"] + outcomes["FP"],
-        "abusive_count": outcomes["TP"] + outcomes["FN"],
-        "outcomes": {name: int(value) for name, value in outcomes.items()},
-        "metrics": {
-            name: float(value) if value is not None else None
-            for name, value in metrics.items()
-        },
-        "average_precision": float(average_precision) if average_precision is not None else None,
-        "evaluation_scope": "Synthetic dataset",
+    comparison.to_csv(output_dir / "budget_comparison.csv", index=False)
+    overlap.to_csv(output_dir / "ranking_overlap.csv", index=False)
+
+    summary = {
+        "evaluation_scope": "Synthetic data; Isolation Forest fitted and scored on the same accounts.",
+        "methods": {},
     }
 
-    with (output_dir / "overall_metrics.json").open("w", encoding="utf-8") as file:
-        json.dump(overall, file, indent=2, allow_nan=False)
+    for method, result in results.items():
+        method_dir = output_dir / method
+        method_dir.mkdir()
 
-    # Keep the joined predictions and labels for tracing each decision.
-    account_results = data.copy()
-    account_results["outcome"] = np.select(
-        [
-            (data["label"] == 1) & data["review_recommended"],
-            (data["label"] == 0) & data["review_recommended"],
-            (data["label"] == 1) & (~data["review_recommended"]),
-        ],
-        ["TP", "FP", "FN"],
-        default="TN",
-    )
+        data = result["data"]
+        data.to_csv(method_dir / "ranked_accounts.csv", index=False)
 
-    account_results.to_csv(output_dir / "account_results.csv", index=False)
+        summary["methods"][method] = {
+            "account_count": len(data),
+            "abusive_count": int(data["label"].sum()),
+            "average_precision": result["average_precision"],
+        }
 
-    missed = account_results[account_results["outcome"] == "FN"]
-    false_alarms = account_results[account_results["outcome"] == "FP"]
+        # Save decisions and scenario results for each review budget.
+        for k, evaluation in result["budgets"].items():
+            budget_dir = method_dir / f"top_{k}"
+            budget_dir.mkdir()
 
-    missed.to_csv(output_dir / "false_negatives.csv", index=False)
-    false_alarms.to_csv(output_dir / "false_positives.csv", index=False)
+            accounts = evaluation["accounts"].copy()
+            selected = accounts["review_recommended"]
+            abusive = accounts["label"].eq(1)
 
-    # Exclude the nested account tables from the top-K summary.
-    top_k_rows = []
+            accounts["outcome"] = np.select(
+                [selected & abusive, selected & ~abusive, ~selected & abusive],
+                ["TP", "FP", "FN"],
+                default="TN",
+            )
 
-    for result in top_k_results:
-        top_k_rows.append({
-            "k": result["k"],
-            "abusive_found": result["abusive_found"],
-            "innocent_found": result["innocent_found"],
-            "precision": result["precision"],
-            "recall": result["recall"],
-        })
+            accounts.to_csv(budget_dir / "account_results.csv", index=False)
+            accounts[selected].to_csv(budget_dir / "selected_accounts.csv", index=False)
+            accounts[accounts["outcome"].eq("FP")].to_csv(budget_dir / "false_positives.csv", index=False)
+            accounts[accounts["outcome"].eq("FN")].to_csv(budget_dir / "false_negatives.csv", index=False)
 
-    columns = ["k", "abusive_found", "innocent_found", "precision", "recall"]
-    pd.DataFrame(top_k_rows, columns=columns).to_csv(output_dir / "top_k_metrics.csv", index=False)
+            result["scenarios"][k].to_csv(budget_dir / "scenario_breakdowns.csv", index=False)
 
-    scenario_breakdowns.to_csv(output_dir / "scenario_breakdowns.csv", index=False, na_rep="")
+    # Preserve the original rules evaluation at its saved score threshold.
+    rule_data = results["rules"]["data"]
+    outcomes = count_outcomes(rule_data)
+    metrics = calculate_metrics(outcomes)
+
+    summary["rules_saved_threshold"] = {
+        "review_count": outcomes["TP"] + outcomes["FP"],
+        "outcomes": outcomes,
+        "metrics": metrics,
+    }
+
+    threshold_dir = output_dir / "rules" / "saved_threshold"
+    threshold_dir.mkdir()
+
+    missed = rule_data["label"].eq(1) & ~rule_data["review_recommended"]
+    false_alarms = rule_data["label"].eq(0) & rule_data["review_recommended"]
+
+    rule_data[missed].to_csv(threshold_dir / "false_negatives.csv", index=False)
+    rule_data[false_alarms].to_csv(threshold_dir / "false_positives.csv", index=False)
+    calculate_scenario_breakdowns(rule_data).to_csv(threshold_dir / "scenario_breakdowns.csv", index=False)
+
+    # Save accounts selected by only one method at each budget.
+    for k in results["rules"]["budgets"]:
+        rule_accounts = results["rules"]["budgets"][k]["accounts"]
+        model_accounts = results["model"]["budgets"][k]["accounts"]
+
+        rule_ids = set(rule_accounts.loc[rule_accounts["review_recommended"], "user_id"])
+        model_ids = set(model_accounts.loc[model_accounts["review_recommended"], "user_id"])
+
+        rule_accounts[rule_accounts["user_id"].isin(rule_ids - model_ids)].to_csv(output_dir / f"rules_only_top_{k}.csv", index=False)
+        model_accounts[model_accounts["user_id"].isin(model_ids - rule_ids)].to_csv(output_dir / f"model_only_top_{k}.csv", index=False)
+
+    with (output_dir / "summary.json").open("w", encoding="utf-8") as file:
+        json.dump(summary, file, indent=4, allow_nan=False)
 
     return output_dir
 
 def main():
-    """Load, evaluate, display, and save detection results."""
+    """Evaluate rules and Isolation Forest using the same labelled accounts."""
 
-    root = Path(__file__).resolve().parent
-    data_dir = root / "data"
+    project_dir = Path(__file__).resolve().parent
+    data_dir = project_dir / "data"
 
-    data = load_evaluation_data(data_dir / "rule_scores.csv", data_dir / "labels.csv")
+    rule_data = load_evaluation_data(data_dir / "rule_scores.csv", data_dir / "labels.csv")
+    model_data = load_evaluation_data(data_dir / "model_scores.csv", data_dir / "labels.csv", score_column="anomaly_score")
 
-    outcomes = count_outcomes(data)
+    if set(rule_data["user_id"]) != set(model_data["user_id"]):
+        raise ValueError("Rules and model results must contain the same accounts.")
+
+    budgets = [10, 20, 40, 60, 120]
+
+    if max(budgets) > len(rule_data):
+        raise ValueError("The dataset contains fewer accounts than the largest review budget.")
+
+    results = {}
+    comparison_rows = []
+    overlap_rows = []
+
+    # Evaluate both methods using identical review budgets.
+    for method, data, score_column in [
+        ("rules", rule_data, "rule_score"),
+        ("model", model_data, "anomaly_score"),
+    ]:
+        results[method] = {
+            "data": data,
+            "average_precision": calculate_average_precision(data, score_column=score_column),
+            "budgets": {},
+            "scenarios": {},
+        }
+
+        for k in budgets:
+            evaluation = evaluate_at_budget(data, k)
+            results[method]["budgets"][k] = evaluation
+            results[method]["scenarios"][k] = calculate_scenario_breakdowns(data, k=k)
+
+            comparison_rows.append({
+                "method": method,
+                "k": k,
+                **evaluation["outcomes"],
+                **evaluation["metrics"],
+            })
+
+    # Compare which accounts appear in both review lists.
+    for k in budgets:
+        rule_ids = set(evaluate_top_k(rule_data, k)["accounts"]["user_id"])
+        model_ids = set(evaluate_top_k(model_data, k)["accounts"]["user_id"])
+
+        shared_ids = rule_ids & model_ids
+        combined_ids = rule_ids | model_ids
+
+        overlap_rows.append({
+            "k": k,
+            "shared_accounts": len(shared_ids),
+            "rules_only": len(rule_ids - model_ids),
+            "model_only": len(model_ids - rule_ids),
+            "overlap_fraction": len(shared_ids) / k,
+            "jaccard_similarity": len(shared_ids) / len(combined_ids),
+        })
+
+    comparison = pd.DataFrame(comparison_rows).sort_values(["k", "method"]).reset_index(drop=True)
+    overlap = pd.DataFrame(overlap_rows)
+
+    print(f"Accounts evaluated per method: {len(rule_data)}")
+    print(f"Accounts labelled abusive: {int(rule_data['label'].sum())}")
+
+    # Keep the original rules threshold results separate from top-k results.
+    outcomes = count_outcomes(rule_data)
     metrics = calculate_metrics(outcomes)
-    average_precision = calculate_average_precision(data)
-    scenario_breakdowns = calculate_scenario_breakdowns(data)
 
-    # Keep each result so it can also be saved.
-    top_k_results = []
-
-    for k in [10, 20, 40, 60, 120]:
-        top_k_results.append(evaluate_top_k(data, k))
-
-    print(f"Accounts evaluated: {len(data)}")
+    print("\nRules at the saved review threshold:")
     print(f"Accounts recommended for review: {outcomes['TP'] + outcomes['FP']}")
-    print(f"Accounts labelled abusive: {outcomes['TP'] + outcomes['FN']}")
 
-    print("\nOutcome counts:")
-    print(f"True positives:  {outcomes['TP']}")
-    print(f"False positives: {outcomes['FP']}")
-    print(f"False negatives: {outcomes['FN']}")
-    print(f"True negatives:  {outcomes['TN']}")
-
-    print("\nPerformance metrics:")
+    for name, value in outcomes.items():
+        print(f"{name}: {value}")
 
     for name, value in metrics.items():
         display_name = name.replace("_", " ").capitalize()
+        display_value = "undefined" if value is None else f"{value:.2%}"
+        print(f"{display_name}: {display_value}")
 
-        if value is None:
-            print(f"{display_name}: undefined")
-        else:
-            print(f"{display_name}: {value:.2%}")
+    print("\nAverage precision:")
 
-    if average_precision is None:
-        print("Average precision: undefined")
-    else:
-        print(f"Average precision: {average_precision:.2%}")
+    for method, result in results.items():
+        value = result["average_precision"]
+        display_value = "undefined" if value is None else f"{value:.2%}"
+        print(f"{method.capitalize()}: {display_value}")
 
-    # Display accounts involved in incorrect decisions.
-    missed = data[(data["label"] == 1) & (~data["review_recommended"])]
-    false_alarms = data[(data["label"] == 0) & data["review_recommended"]]
-    columns = ["user_id", "pattern", "rule_score", "triggered_rules", "evidence_summary"]
+    # Format a display copy without changing the saved numeric results.
+    display = comparison.copy()
 
-    print("\nMissed abusive accounts:")
+    for column in ["accuracy", "precision", "recall", "f1", "false_positive_rate"]:
+        display[column] = display[column].map(lambda value: "undefined" if pd.isna(value) else f"{value:.2%}")
 
-    if missed.empty:
-        print("None")
-    else:
-        print(missed[columns].fillna({"triggered_rules": "None"}).to_string(index=False))
+    print("\nComparison at equal review budgets:")
+    print(display.to_string(index=False))
 
-    print("\nInnocent accounts incorrectly flagged:")
+    print("\nRanking overlap:")
+    print(overlap.to_string(index=False, float_format=lambda value: f"{value:.4f}"))
 
-    if false_alarms.empty:
-        print("None")
-    else:
-        print(false_alarms[columns].fillna({"triggered_rules": "None"}).to_string(index=False))
+    print("\nScenario breakdowns at a review budget of 40:")
 
-    print("\nTop-K evaluation:")
+    for method, result in results.items():
+        print(f"\n{method.capitalize()}:")
+        print(result["scenarios"][40].to_string(index=False, na_rep="undefined", float_format=lambda value: f"{value:.4f}"))
 
-    for result in top_k_results:
-        k = result["k"]
+    print("\nScenario metric values are fractions: 0.7500 means 75%.")
 
-        print(f"\nTop {k} accounts:")
-        print(f"Abusive accounts found: {result['abusive_found']}")
-        print(f"Innocent accounts included: {result['innocent_found']}")
-        print(f"Precision@{k}: {result['precision']:.2%}")
+    run_name = datetime.now(timezone.utc).strftime("comparison_%Y%m%d_%H%M%S_%f_UTC")
+    output_dir = save_reports(results, comparison, overlap, project_dir / "reports" / run_name)
 
-        if result["recall"] is None:
-            print(f"Recall@{k}: undefined")
-        else:
-            print(f"Recall@{k}: {result['recall']:.2%}")
-
-    print("\nScenario breakdowns:")
-    print(scenario_breakdowns.to_string(index=False, na_rep="undefined", float_format=lambda value: f"{value:.4f}"))
-    print("Scenario metric values are fractions: 0.7500 means 75%.")
-
-    # Use UTC timestamps with microseconds to distinguish evaluation runs.
-    run_name = datetime.now(timezone.utc).strftime("rules_%Y%m%d_%H%M%S_%f_UTC")
-    output_dir = root / "reports" / run_name
-
-    saved_dir = save_reports(data, outcomes, metrics, average_precision, top_k_results, scenario_breakdowns, output_dir)
-
-    print(f"\nReports saved to: {saved_dir}")
-    print("Evaluation on synthetic data.")
+    print(f"\nReports saved to: {output_dir}")
+    print("Evaluation on synthetic data; the model was fitted and scored on the same accounts.")
 
 
 if __name__ == "__main__":
