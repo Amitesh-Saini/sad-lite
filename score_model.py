@@ -7,25 +7,51 @@ This file provides a machine-learning approach that we can compare with
 our rule-based detector. Instead of assigning points using explicit rules,
 the model looks for unusual combinations of account features.
 
+How Isolation Forest works:
+- Pick a random feature, then a random split point between that feature's
+  minimum and maximum. Repeat until each account sits alone or a depth
+  limit is reached.
+- Unusual accounts sit away from the crowd, so random splits separate them
+  in few steps. Ordinary accounts sit in dense regions and take many.
+- Averaging the isolation depth over many random trees gives the score.
+Reference: Liu, Ting & Zhou, "Isolation Forest", ICDM 2008.
+
 What this file does:
 - Loads and validates the account summaries from features.csv.
-- Selects numeric features and handles documented missing values.
+- Selects behaviour features and handles documented missing values.
 - Fits Isolation Forest using a fixed random seed for reproducibility.
 - Gives each account an anomaly score, with higher scores meaning
   more unusual behaviour.
 - Saves ranked accounts to model_scores.csv.
 - Saves the settings and feature choices used for the run.
 
+Feature choices:
+- Rates, diversity, regularity, outcomes, account age, and the entity
+  graph, including accounts sharing an IP address.
+- Raw volume (session counts, total time, total bytes) and average levels
+  (mean duration, mean input rate) are excluded. They mostly measure how
+  much or how intensely someone plays, which varies widely among honest
+  players, rather than how strange their behaviour is.
+- Features are not standardised. Isolation Forest chooses each split
+  uniformly between a feature's minimum and maximum, so rescaling a
+  feature does not change which accounts are isolated.
+
 User IDs identify results but are not model inputs. Ground-truth labels,
 scenario names, and rule scores are excluded from the model inputs.
+The model never sees labels, so it cannot learn that a shared IP is
+usually innocent: nobody told it, and it has no labels to learn it from.
 
 Evaluation happens separately in evaluate.py, where we compare the
 model's ranking with the known labels and our rule-based results.
 
 An unusual account is not necessarily abusive. Scores are review
 priorities, not probabilities or automatic punishment decisions.
+
+Sources: the feature selection follows the SAD-Lite reference
+implementation (sadlite/score_model.py), without its standardisation step.
 """
 
+import argparse
 import hashlib
 import json
 from pathlib import Path
@@ -34,6 +60,13 @@ import numpy as np
 import pandas as pd
 import sklearn
 from sklearn.ensemble import IsolationForest
+
+# Features that may be undefined, and why (see features.py).
+OPTIONAL_COLUMNS = ["input_cv", "duration_cv", "termination_game_concentration"]
+
+# Concentration is only defined with at least this many terminations.
+MIN_TERMINATIONS_FOR_CONCENTRATION = 3
+
 
 def load_features(file_path):
     """Load and validate one feature row per account."""
@@ -44,19 +77,20 @@ def load_features(file_path):
         raise FileNotFoundError(f"Feature file not found: {file_path}")
 
     count_columns = [
-        "session_count", "distinct_devices", "distinct_ips",
-        "distinct_countries", "distinct_games", "termination_count",
-        "active_days", "max_sessions_per_day", "max_devices_per_day",
-        "max_countries_per_day", "max_other_users_on_ip",
-        "max_other_users_on_device", "max_other_users_on_payment",
-        "payment_attempt_count", "payment_failure_count",
+        "session_count", "active_days", "max_sessions_per_day",
+        "distinct_devices", "distinct_ips", "distinct_countries",
+        "distinct_games", "max_devices_per_day", "max_ips_per_day",
+        "max_countries_per_day", "distinct_hours", "termination_count",
+        "max_other_users_on_ip", "max_other_users_on_device",
+        "max_other_users_on_payment",
     ]
 
     measurement_columns = [
-        "termination_rate", "total_duration_min", "mean_duration_min",
-        "mean_input_rate", "total_bytes_streamed", "std_duration_min",
-        "std_input_rate", "duration_cv", "input_cv",
-        "account_age_at_first_session_days", "payment_failure_rate",
+        "sessions_per_active_day", "total_duration_min", "total_bytes_streamed",
+        "mean_duration_min", "std_duration_min", "duration_cv",
+        "mean_input_rate", "std_input_rate", "input_cv",
+        "termination_rate", "termination_game_concentration",
+        "account_age_at_first_session_days",
     ]
 
     numeric_columns = count_columns + measurement_columns
@@ -104,10 +138,7 @@ def load_features(file_path):
             raise ValueError(f"{column} contains negative values.")
 
     # These features can be undefined under specific conditions.
-    optional_columns = {
-        "std_duration_min", "std_input_rate",
-        "duration_cv", "input_cv", "payment_failure_rate",
-    }
+    optional_columns = {"std_duration_min", "std_input_rate", *OPTIONAL_COLUMNS}
 
     for column in numeric_columns:
         if column not in optional_columns and data[column].isna().any():
@@ -118,10 +149,11 @@ def load_features(file_path):
             raise ValueError(f"{column} must contain whole numbers.")
 
     positive_columns = [
-        "session_count", "distinct_devices", "distinct_ips",
-        "distinct_countries", "distinct_games", "active_days",
-        "max_sessions_per_day", "max_devices_per_day",
-        "max_countries_per_day", "total_duration_min", "mean_duration_min",
+        "session_count", "active_days", "sessions_per_active_day",
+        "max_sessions_per_day", "distinct_devices", "distinct_ips",
+        "distinct_countries", "distinct_games", "max_devices_per_day",
+        "max_ips_per_day", "max_countries_per_day", "distinct_hours",
+        "total_duration_min", "mean_duration_min",
     ]
 
     for column in positive_columns:
@@ -130,17 +162,21 @@ def load_features(file_path):
 
     # Counts within an account cannot exceed its session count.
     bounded_columns = [
-        "distinct_devices", "distinct_ips", "distinct_countries",
-        "distinct_games", "termination_count", "active_days",
-        "max_sessions_per_day", "payment_attempt_count",
+        "active_days", "max_sessions_per_day", "distinct_devices",
+        "distinct_ips", "distinct_countries", "distinct_games",
+        "distinct_hours", "termination_count",
     ]
 
     for column in bounded_columns:
         if data[column].gt(data["session_count"]).any():
             raise ValueError(f"{column} cannot exceed session_count.")
 
+    if data["distinct_hours"].gt(24).any():
+        raise ValueError("distinct_hours cannot exceed 24.")
+
     daily_limits = {
         "max_devices_per_day": "distinct_devices",
+        "max_ips_per_day": "distinct_ips",
         "max_countries_per_day": "distinct_countries",
     }
 
@@ -155,18 +191,15 @@ def load_features(file_path):
         if data[column].gt(len(data) - 1).any():
             raise ValueError(f"{column} exceeds the number of other accounts.")
 
-    if data["payment_failure_count"].gt(data["payment_attempt_count"]).any():
-        raise ValueError("Payment failures cannot exceed payment attempts.")
-
     # Check derived values against their underlying counts.
     expected_termination_rate = data["termination_count"] / data["session_count"]
     expected_mean_duration = data["total_duration_min"] / data["session_count"]
-    expected_payment_rate = data["payment_failure_count"] / data["payment_attempt_count"].replace(0, np.nan)
+    expected_sessions_per_day = data["session_count"] / data["active_days"]
 
     derived_values = {
         "termination_rate": expected_termination_rate,
         "mean_duration_min": expected_mean_duration,
-        "payment_failure_rate": expected_payment_rate,
+        "sessions_per_active_day": expected_sessions_per_day,
     }
 
     for column, expected in derived_values.items():
@@ -187,28 +220,46 @@ def load_features(file_path):
         if not np.allclose(data[column], expected, rtol=1e-5, atol=1e-8, equal_nan=True):
             raise ValueError(f"{column} does not match standard deviation divided by mean.")
 
+    # Concentration is undefined only when there are too few terminations.
+    too_few_terminations = data["termination_count"].lt(MIN_TERMINATIONS_FOR_CONCENTRATION)
+
+    if not data["termination_game_concentration"].isna().equals(too_few_terminations):
+        raise ValueError(
+            f"termination_game_concentration must be missing only below "
+            f"{MIN_TERMINATIONS_FOR_CONCENTRATION} terminations."
+        )
+
+    if not data["termination_game_concentration"].dropna().between(0, 1).all():
+        raise ValueError("termination_game_concentration must be between 0 and 1.")
+
     return data[expected_columns].copy()
 
 def select_model_features(data):
-    """Select numeric behaviour features without IDs, labels, or rule scores."""
+    """Select behaviour features without IDs, labels, rule scores, or raw volume."""
 
     feature_columns = [
-        "session_count",
-        "termination_rate",
-        "mean_input_rate",
-        "input_cv",
-        "mean_duration_min",
-        "duration_cv",
+        # Rate rather than volume.
+        "sessions_per_active_day",
+        # Diversity.
+        "distinct_ips",
         "distinct_devices",
         "distinct_countries",
-        "max_sessions_per_day",
+        "max_ips_per_day",
         "max_devices_per_day",
         "max_countries_per_day",
+        # Regularity.
+        "duration_cv",
+        "input_cv",
+        "distinct_hours",
+        # Outcomes.
+        "termination_rate",
+        "termination_game_concentration",
+        # Account age.
         "account_age_at_first_session_days",
+        # Entity graph, including the IP-sharing feature behind the dorm problem.
         "max_other_users_on_device",
         "max_other_users_on_payment",
-        "payment_attempt_count",
-        "payment_failure_rate",
+        "max_other_users_on_ip",
     ]
 
     missing_columns = set(feature_columns) - set(data.columns)
@@ -230,9 +281,7 @@ def handle_missing_values(model_features, fill_values=None):
 
     prepared = model_features.copy()
 
-    optional_columns = ["input_cv", "duration_cv", "payment_failure_rate"]
-
-    for column in optional_columns:
+    for column in OPTIONAL_COLUMNS:
         if column not in prepared.columns:
             raise ValueError(f"Missing required feature: {column}")
 
@@ -244,14 +293,16 @@ def handle_missing_values(model_features, fill_values=None):
         if np.isinf(prepared[column].to_numpy(dtype=float)).any():
             raise ValueError(f"{column} contains infinite values.")
 
-        if column not in optional_columns and prepared[column].isna().any():
+        if column not in OPTIONAL_COLUMNS and prepared[column].isna().any():
             raise ValueError(f"{column} contains unexpected missing values.")
 
     # Learn replacement values only when preparing training data.
+    # The median of the defined values is a neutral, typical value;
+    # the indicator column keeps the fact that the value was undefined.
     if fill_values is None:
-        fill_values = {"payment_failure_rate": 0.0}
+        fill_values = {}
 
-        for column in ["input_cv", "duration_cv"]:
+        for column in OPTIONAL_COLUMNS:
             available_values = prepared[column].dropna()
 
             if available_values.empty:
@@ -261,8 +312,8 @@ def handle_missing_values(model_features, fill_values=None):
     else:
         fill_values = dict(fill_values)
 
-        if set(fill_values) != set(optional_columns):
-            raise ValueError(f"fill_values must contain exactly: {optional_columns}")
+        if set(fill_values) != set(OPTIONAL_COLUMNS):
+            raise ValueError(f"fill_values must contain exactly: {OPTIONAL_COLUMNS}")
 
     # Check supplied replacements before applying them.
     for column, value in fill_values.items():
@@ -274,11 +325,10 @@ def handle_missing_values(model_features, fill_values=None):
 
         fill_values[column] = float(value)
 
-    if fill_values["payment_failure_rate"] != 0:
-        raise ValueError("The replacement for payment_failure_rate must be zero.")
-
-    # Always add all three indicators so the model's columns stay consistent.
-    for column in optional_columns:
+    # Always add all indicators so the model's columns stay consistent.
+    # An indicator that is always 0 (for example when every account has
+    # enough sessions for a CV) cannot be split on, so it does no harm.
+    for column in OPTIONAL_COLUMNS:
         prepared[f"{column}_missing"] = prepared[column].isna().astype(int)
         prepared[column] = prepared[column].fillna(fill_values[column])
 
@@ -300,6 +350,7 @@ def fit_isolation_forest(prepared_features, random_state=42, n_estimators=300):
     if not np.isfinite(prepared_features.to_numpy(dtype=float)).all():
         raise ValueError("Model features must not contain missing or infinite values.")
 
+    # max_samples="auto" uses min(256, number of accounts) per tree, as in the original paper.
     model = IsolationForest(n_estimators=n_estimators, max_samples="auto", contamination="auto", max_features=1.0, bootstrap=False, n_jobs=1, random_state=random_state, verbose=0, warm_start=False)
 
     # Build the trees using account features, without ground-truth labels.
@@ -363,16 +414,28 @@ def rank_and_save_scores(data, anomaly_scores, output_path):
 
     return ranked
 
+def score_accounts(data, random_state=42, n_estimators=300):
+    """Prepare features, fit the model, and return scores with the settings used."""
+
+    model_features = select_model_features(data)
+    prepared_features, fill_values = handle_missing_values(model_features)
+
+    model = fit_isolation_forest(prepared_features, random_state=random_state, n_estimators=n_estimators)
+    anomaly_scores = calculate_anomaly_scores(model, prepared_features)
+
+    return anomaly_scores, model, model_features, prepared_features, fill_values
+
 def display_results(ranked, output_path, top_n=15):
     """Display the highest-ranked accounts and the output location."""
 
-    if isinstance(top_n, bool) or not isinstance(top_n, int) or top_n < 1:
-        raise ValueError("top_n must be a positive integer.")
+    if isinstance(top_n, bool) or not isinstance(top_n, int) or top_n < 0:
+        raise ValueError("top_n must be a nonnegative integer.")
 
     shown = min(top_n, len(ranked))
 
-    print(f"\nTop {shown} most unusual accounts:")
-    print(ranked.head(shown).to_string(index=False, float_format=lambda value: f"{value:.6f}"))
+    if shown:
+        print(f"\nTop {shown} most unusual accounts:")
+        print(ranked.head(shown).to_string(index=False, float_format=lambda value: f"{value:.6f}"))
 
     print(f"\nScored {len(ranked)} accounts.")
     print(f"Ranking saved to: {output_path}")
@@ -386,29 +449,33 @@ def main():
     data_dir = project_dir / "data"
     reports_dir = project_dir / "reports"
 
+    parser = argparse.ArgumentParser(description="Rank accounts with an Isolation Forest.")
+    parser.add_argument("--seed", type=int, default=42, help="random seed for the forest; record it in any write-up")
+    parser.add_argument("--output", type=Path, default=data_dir / "model_scores.csv", help="where to save the ranking")
+    parser.add_argument("--top", type=int, default=15, help="how many accounts to print")
+    args = parser.parse_args()
+
     features_path = data_dir / "features.csv"
-    output_path = data_dir / "model_scores.csv"
-    settings_path = reports_dir / "model_settings.json"
+    settings_path = reports_dir / f"model_settings_{args.output.stem}.json"
 
     # Load features and prepare numeric model inputs.
     data = load_features(features_path)
-    model_features = select_model_features(data)
-    prepared_features, fill_values = handle_missing_values(model_features)
 
     # Fit the model and score the same accounts for our initial comparison.
-    model = fit_isolation_forest(prepared_features, random_state=42, n_estimators=300)
-    anomaly_scores = calculate_anomaly_scores(model, prepared_features)
-    ranked = rank_and_save_scores(data, anomaly_scores, output_path)
+    anomaly_scores, model, model_features, prepared_features, fill_values = score_accounts(data, random_state=args.seed)
+    ranked = rank_and_save_scores(data, anomaly_scores, args.output)
 
     # Record the settings and preprocessing choices used for this run.
     settings = {
         "model_type": "IsolationForest",
         "model_parameters": model.get_params(),
         "sklearn_version": sklearn.__version__,
+        "random_seed": args.seed,
         "account_count": len(data),
         "selected_features": model_features.columns.tolist(),
         "prepared_features": prepared_features.columns.tolist(),
         "missing_value_replacements": fill_values,
+        "standardised": False,
         "score_definition": "-model.score_samples(prepared_features)",
         "higher_scores_mean": "More unusual behaviour",
         "evaluation_scope": "Model fitted and scored on the same synthetic accounts.",
@@ -419,7 +486,7 @@ def main():
     with settings_path.open("w", encoding="utf-8") as file:
         json.dump(settings, file, indent=4, allow_nan=False)
 
-    display_results(ranked, output_path)
+    display_results(ranked, args.output, top_n=args.top)
 
     print(f"Model settings saved to: {settings_path}")
     print("Initial comparison: fitted and scored on the same synthetic dataset.")

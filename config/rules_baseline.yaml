@@ -1,32 +1,51 @@
-termination:
+shared_device:
+  weight: 3.0
+  trigger: 3
+  saturate: 19
+shared_payment:
+  weight: 2.5
+  trigger: 2
+  saturate: 19
+termination_rate:
+  weight: 3.0
+  trigger: 0.08
+  saturate: 0.4
   min_sessions: 10
   min_events: 3
-  min_rate: 0.2
-  weight: 30
-automation:
+countries_per_day:
+  weight: 2.5
+  trigger: 1
+  saturate: 4
+duration_consistency:
+  weight: 2.0
+  trigger: 0.25
+  saturate: 0.05
   min_sessions: 10
-  max_input_cv: 0.05
-  max_duration_cv: 0.05
-  weight: 30
-diversity:
+input_consistency:
+  weight: 2.0
+  trigger: 0.15
+  saturate: 0.03
   min_sessions: 10
-  min_daily_devices: 3
-  min_daily_countries: 3
-  single_weight: 10
-  both_weight: 25
-coordination:
-  min_other_device_users: 2
-  min_other_payment_users: 2
-  weight: 10
-  max_age_days: 14
-  young_bonus: 15
-payment:
-  min_attempts: 5
-  min_failures: 3
-  min_rate: 0.5
-  weight: 5
+distinct_devices:
+  weight: 1.5
+  trigger: 3
+  saturate: 8
+ips_per_day:
+  weight: 1.5
+  trigger: 2
+  saturate: 8
+round_the_clock:
+  weight: 1.5
+  trigger: 18
+  saturate: 24
+new_account:
+  weight: 1.5
+  trigger: 21
+  saturate: 1
 shared_ip:
-  min_other_users: 10
-  weight: 0
+  weight: 0.4
+  trigger: 14
+  saturate: 79
 review:
-  min_score: 25
+  min_score: 0.14
+  capacity: 40

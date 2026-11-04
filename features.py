@@ -5,33 +5,97 @@
 # Reads data/sessions.csv and writes data/features.csv.
 # Converts many session records into one summary row per account.
 #
-# Features cover activity counts, distinct identifiers, termination rates,
-# duration/input variability, daily maxima, account age, shared entities,
-# and payment failures.
+# Features are grouped into families (see FEATURE_FAMILIES):
+# - Volume: how much an account plays.
+# - Diversity: how many distinct IPs, devices, countries, and games it uses,
+#   overall and within a single day.
+# - Regularity: how human-shaped its behaviour is (variation in duration and
+#   input activity, and the spread of hours it plays).
+# - Outcomes: how its sessions end, and whether terminations concentrate on
+#   one game.
+# - Account age: how old the account was when it first played.
+# - Entity graph: how many other accounts share its IPs, devices, and
+#   payment identifiers.
 #
 # Definitions:
-# - Days are UTC calendar days, assigned using session_start.
+# - Days and hours are UTC, assigned using session_start.
 # - Account age is measured at the first observed session.
 # - Shared-entity counts exclude the account itself.
 # - Input mean is an unweighted average of session-level input rates.
 # - Standard deviation uses the sample formula (ddof=1).
-# - Payment failure rate is failures divided by payment attempts.
+# - Termination game concentration is the share of an account's terminated
+#   sessions that occurred on its most-terminated game.
 #
 # Undefined values remain blank in the output:
 # - Sample standard deviation and CV require at least two sessions.
 # - Input CV is undefined when the mean input rate is zero.
-# - Payment failure rate is undefined when there are no payment attempts.
+# - Termination game concentration is undefined with fewer than three
+#   terminations, because one or two cannot show a concentration.
 # These require an explicit handling policy before model fitting.
 #
 # Does not read labels.csv or incident_truth.json.
 # user_id identifies rows; it must not be used as a numerical model feature.
 # Features describe behaviour and do not establish whether an account is abusive.
+# Hours are UTC, not each player's local time; in this synthetic data all
+# session times are generated in UTC.
 # =============================================================================
 
 from pathlib import Path
 
 import numpy as np
 import pandas as pd
+
+
+TERMINATED_ENDINGS = ("terminated_anticheat", "terminated_abuse")
+
+# Concentration needs several terminations to mean anything:
+# one termination is always "100% on one game".
+MIN_TERMINATIONS_FOR_CONCENTRATION = 3
+
+# Output column order, grouped by family.
+FEATURE_FAMILIES = {
+    "volume": [
+        "session_count",
+        "active_days",
+        "sessions_per_active_day",
+        "max_sessions_per_day",
+        "total_duration_min",
+        "total_bytes_streamed",
+    ],
+    "diversity": [
+        "distinct_devices",
+        "distinct_ips",
+        "distinct_countries",
+        "distinct_games",
+        "max_devices_per_day",
+        "max_ips_per_day",
+        "max_countries_per_day",
+    ],
+    "regularity": [
+        "mean_duration_min",
+        "std_duration_min",
+        "duration_cv",
+        "mean_input_rate",
+        "std_input_rate",
+        "input_cv",
+        "distinct_hours",
+    ],
+    "outcomes": [
+        "termination_count",
+        "termination_rate",
+        "termination_game_concentration",
+    ],
+    "account_age": [
+        "account_age_at_first_session_days",
+    ],
+    "entity_graph": [
+        "max_other_users_on_ip",
+        "max_other_users_on_device",
+        "max_other_users_on_payment",
+    ],
+}
+
+FEATURE_COLUMNS = [column for columns in FEATURE_FAMILIES.values() for column in columns]
 
 
 def prepare_sessions(sessions):
@@ -43,7 +107,7 @@ def prepare_sessions(sessions):
         "session_uuid", "user_id", "account_created_at", "session_start",
         "session_end", "duration_min", "client_ip", "country", "device_id",
         "app_id", "input_events_per_min", "bytes_streamed", "payment_hash",
-        "end_reason", "payment_status",
+        "end_reason",
     ]
 
     missing = set(required) - set(sessions.columns)
@@ -105,9 +169,6 @@ def prepare_sessions(sessions):
     if not sessions["end_reason"].isin(valid_endings).all():
         raise ValueError("Unknown session end reason")
 
-    if not sessions["payment_status"].isin(["not_attempted", "succeeded", "failed"]).all():
-        raise ValueError("Unknown payment status")
-
     return sessions
 
 
@@ -138,7 +199,7 @@ def create_summary(sessions):
         item["countries"].add(session.country)
         item["games"].add(session.app_id)
 
-        item["terminations"] += session.end_reason in ("terminated_anticheat", "terminated_abuse")
+        item["terminations"] += session.end_reason in TERMINATED_ENDINGS
         item["duration"] += session.duration_min
         item["input"] += session.input_events_per_min
         item["bytes"] += session.bytes_streamed
@@ -164,6 +225,40 @@ def create_summary(sessions):
     return pd.DataFrame(rows)
 
 
+def add_daily_features(sessions, summary):
+    """Calculate active days and maximum activity within one UTC start-date."""
+
+    daily_sessions = sessions.assign(session_day=sessions["session_start"].dt.floor("D"))
+
+    daily = daily_sessions.groupby(["user_id", "session_day"]).agg(
+        daily_sessions=("session_uuid", "size"),
+        daily_devices=("device_id", "nunique"),
+        daily_ips=("client_ip", "nunique"),
+        daily_countries=("country", "nunique"),
+    )
+
+    grouped = daily.groupby(level="user_id")
+
+    summary["active_days"] = summary["user_id"].map(grouped.size())
+
+    # Average sessions on the days the account actually played.
+    summary["sessions_per_active_day"] = summary["session_count"] / summary["active_days"]
+
+    # A burst in one day is hidden by a 30-day distinct count;
+    # nine IPs over a month differs from nine IPs in one day.
+    mappings = [
+        ("daily_sessions", "max_sessions_per_day"),
+        ("daily_devices", "max_devices_per_day"),
+        ("daily_ips", "max_ips_per_day"),
+        ("daily_countries", "max_countries_per_day"),
+    ]
+
+    for source, target in mappings:
+        summary[target] = summary["user_id"].map(grouped[source].max())
+
+    return summary
+
+
 def add_variability_features(sessions, summary):
     """Measure variation in duration and session-average input activity."""
 
@@ -178,29 +273,31 @@ def add_variability_features(sessions, summary):
     return summary
 
 
-def add_daily_features(sessions, summary):
-    """Calculate active days and maximum activity within one UTC start-date."""
+def add_time_of_day_features(sessions, summary):
+    """Count the distinct UTC hours in which each account starts sessions."""
 
-    daily_sessions = sessions.assign(session_day=sessions["session_start"].dt.floor("D"))
+    # People play at some times of day; a value near 24 means round-the-clock play.
+    hours = sessions["session_start"].dt.hour
 
-    daily = daily_sessions.groupby(["user_id", "session_day"]).agg(
-        daily_sessions=("session_uuid", "size"),
-        daily_devices=("device_id", "nunique"),
-        daily_countries=("country", "nunique"),
-    )
+    summary["distinct_hours"] = summary["user_id"].map(hours.groupby(sessions["user_id"]).nunique())
 
-    grouped = daily.groupby(level="user_id")
+    return summary
 
-    summary["active_days"] = summary["user_id"].map(grouped.size())
 
-    mappings = [
-        ("daily_sessions", "max_sessions_per_day"),
-        ("daily_devices", "max_devices_per_day"),
-        ("daily_countries", "max_countries_per_day"),
-    ]
+def add_termination_features(sessions, summary):
+    """Measure how concentrated each account's terminations are on one game."""
 
-    for source, target in mappings:
-        summary[target] = summary["user_id"].map(grouped[source].max())
+    terminated = sessions[sessions["end_reason"].isin(TERMINATED_ENDINGS)]
+
+    # Terminations on the account's most-terminated game, over all its terminations.
+    per_game = terminated.groupby(["user_id", "app_id"]).size()
+    top_game = per_game.groupby(level="user_id").max()
+    total = terminated.groupby("user_id").size()
+
+    # Too few terminations leaves concentration undefined, so it stays blank.
+    concentration = (top_game / total)[total >= MIN_TERMINATIONS_FOR_CONCENTRATION]
+
+    summary["termination_game_concentration"] = summary["user_id"].map(concentration)
 
     return summary
 
@@ -241,23 +338,11 @@ def add_shared_entity_features(sessions, summary):
     return summary
 
 
-def add_payment_features(sessions, summary):
-    """Count payment attempts and failures, then calculate failure rates."""
-
-    attempted = sessions["payment_status"].isin(["succeeded", "failed"])
-    failed = sessions["payment_status"].eq("failed")
-
-    summary["payment_attempt_count"] = summary["user_id"].map(attempted.groupby(sessions["user_id"]).sum())
-    summary["payment_failure_count"] = summary["user_id"].map(failed.groupby(sessions["user_id"]).sum())
-
-    # Zero attempts means the rate is undefined, not a measured zero.
-    summary["payment_failure_rate"] = summary["payment_failure_count"] / summary["payment_attempt_count"].replace(0, np.nan)
-
-    return summary
-
-
 def validate_summary(sessions, summary):
     """Reject inconsistent outputs and unexplained missing values."""
+
+    if list(summary.columns) != ["user_id"] + FEATURE_COLUMNS:
+        raise ValueError("Summary columns do not match FEATURE_FAMILIES")
 
     if not summary["user_id"].is_unique or set(summary["user_id"]) != set(sessions["user_id"]):
         raise ValueError("Summary must contain exactly one row per account")
@@ -279,7 +364,7 @@ def validate_summary(sessions, summary):
         "std_input_rate": summary["session_count"] < 2,
         "duration_cv": summary["session_count"] < 2,
         "input_cv": (summary["session_count"] < 2) | summary["mean_input_rate"].eq(0),
-        "payment_failure_rate": summary["payment_attempt_count"].eq(0),
+        "termination_game_concentration": summary["termination_count"] < MIN_TERMINATIONS_FOR_CONCENTRATION,
     }
 
     for column in numeric.columns:
@@ -288,9 +373,15 @@ def validate_summary(sessions, summary):
         if not numeric[column].isna().equals(expected):
             raise ValueError(f"Unexpected missing-value pattern in {column}")
 
-    for column in ["termination_rate", "payment_failure_rate"]:
+    for column in ["termination_rate", "termination_game_concentration"]:
         if not summary[column].dropna().between(0, 1).all():
             raise ValueError(f"{column} is outside [0, 1]")
+
+    if not summary["distinct_hours"].between(1, 24).all():
+        raise ValueError("distinct_hours is outside [1, 24]")
+
+    if (summary["max_ips_per_day"] > summary["distinct_ips"]).any():
+        raise ValueError("max_ips_per_day cannot exceed distinct_ips")
 
 
 def build_features(sessions):
@@ -300,15 +391,19 @@ def build_features(sessions):
     summary = create_summary(sessions)
 
     helpers = [
-        add_variability_features,
         add_daily_features,
+        add_variability_features,
+        add_time_of_day_features,
+        add_termination_features,
         add_account_age,
         add_shared_entity_features,
-        add_payment_features,
     ]
 
     for helper in helpers:
         summary = helper(sessions, summary)
+
+    # Arrange columns by family so the output reads in the same order as the docs.
+    summary = summary[["user_id"] + FEATURE_COLUMNS]
 
     validate_summary(sessions, summary)
 
@@ -328,6 +423,10 @@ def main():
     print(summary.head().to_string(index=False))
     print(f"Created {len(summary)} account summaries with {len(summary.columns) - 1} numeric features")
     print(f"Saved to: {output_path}")
+
+    print("\nFeatures by family:")
+    for family, columns in FEATURE_FAMILIES.items():
+        print(f"  {family}: {', '.join(columns)}")
 
     missing = summary.isna().sum()
 
