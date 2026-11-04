@@ -1336,32 +1336,47 @@ def check_dataset(sessions, labels):
                 raise ValueError(f"{user_id} has overlapping sessions")
 
 
+def build_dataset(seed=42, days=30, include_incident=True):
+    """Generate and check the full dataset in memory, without writing files.
+
+    include_incident=False produces the identical dataset minus the incident
+    surge: the incident uses its own random generator, so every other session
+    is unchanged. Tests compare the two to measure the incident's own effect.
+    """
+
+    simulation_start = datetime(2026, 1, 1, tzinfo=timezone.utc)
+
+    # Generate every account type with fixed counts.
+    sessions, labels, used_ids = make_mixed_dataset(simulation_start, days=days, seed=seed)
+
+    incident = None
+
+    if include_incident:
+        # Day 22 of the simulation (counting from day 0, i.e. 23 January),
+        # from 18:00 to midnight UTC.
+        incident_start = simulation_start + timedelta(days=22, hours=18)
+        incident = inject_game_incident(sessions, labels, random.Random(seed + 1), incident_start, used_ids)
+
+    assign_session_ids(sessions)
+
+    # Basic checks before anything uses the data.
+    check_dataset(sessions, labels)
+
+    return sessions, labels, incident
+
+
 def main():
     parser = argparse.ArgumentParser(description="Generate synthetic SAD-Lite session data.")
     parser.add_argument("--seed", type=int, default=42, help="record the seed you used in any write-up")
     args = parser.parse_args()
 
-    simulation_start = datetime(2026, 1, 1, tzinfo=timezone.utc)
-    days = 30
-
-    # Generate every account type with fixed counts.
-    sessions, labels, used_ids = make_mixed_dataset(simulation_start, days=days, seed=args.seed)
-
-    # Day 22 of the simulation (counting from day 0, i.e. 23 January),
-    # from 18:00 to midnight UTC.
-    incident_start = simulation_start + timedelta(days=22, hours=18)
-    incident = inject_game_incident(sessions, labels, random.Random(args.seed + 1), incident_start, used_ids)
+    sessions, labels, incident = build_dataset(seed=args.seed)
 
     print(f"\nGame incident: {incident['game_name']} ({incident['app_id']})")
     print(f"Sessions in incident window: {incident['window_sessions']}")
     print(f"Terminated in incident window: {incident['window_terminated']}")
     print(f"Termination rate in window: {incident['window_termination_rate']:.1%}")
     print(f"Termination rate for this game outside the window: {incident['baseline_termination_rate']:.1%}")
-
-    assign_session_ids(sessions)
-
-    # Basic checks before writing files.
-    check_dataset(sessions, labels)
 
     # Resolve paths relative to this file, regardless of terminal location.
     output_dir = Path(__file__).resolve().parent / "data"
