@@ -2,7 +2,9 @@
 # SAD-Lite — Account Feature Extraction
 # =============================================================================
 #
-# Reads data/sessions.csv and writes data/features.csv.
+# Reads data/generate/sessions.csv and publishes data/features/features.csv,
+# with a manifest recording the hash of the sessions it was built from
+# (see provenance.py).
 # Converts many session records into one summary row per account.
 #
 # Features are grouped into families (see FEATURE_FAMILIES):
@@ -44,6 +46,8 @@ from pathlib import Path
 
 import numpy as np
 import pandas as pd
+
+import provenance
 
 
 TERMINATED_ENDINGS = ("terminated_anticheat", "terminated_abuse")
@@ -414,11 +418,22 @@ def main():
     # Resolve paths relative to this file, regardless of terminal location.
     data_dir = Path(__file__).resolve().parent / "data"
 
-    sessions = pd.read_csv(data_dir / "sessions.csv")
+    # Read the published sessions once; hash and parse the same bytes.
+    manifest, contents = provenance.load_stage(data_dir, "generate", ["sessions.csv"])
+    sessions_bytes = contents["sessions.csv"]
+
+    sessions = provenance.frame_from_bytes(sessions_bytes)
     summary = build_features(sessions)
 
-    output_path = data_dir / "features.csv"
-    summary.to_csv(output_path, index=False, na_rep="")
+    provenance.publish_stage(
+        data_dir, "features",
+        files={"features.csv": provenance.frame_to_bytes(summary, na_rep="")},
+        inputs={"sessions": provenance.input_record("generate", "sessions.csv", provenance.sha256_bytes(sessions_bytes))},
+        settings={"min_terminations_for_concentration": MIN_TERMINATIONS_FOR_CONCENTRATION},
+        code_path=__file__,
+    )
+
+    output_path = data_dir / "features" / "features.csv"
 
     print(summary.head().to_string(index=False))
     print(f"Created {len(summary)} account summaries with {len(summary.columns) - 1} numeric features")

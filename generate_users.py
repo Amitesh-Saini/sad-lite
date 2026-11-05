@@ -90,6 +90,14 @@
 # Raw synthetic IDs and IP addresses must not reveal account types to detectors.
 # Good results on this generated data do not establish real-world accuracy.
 #
+# OUTPUT
+# Two stages are published through provenance.py (see its trust model):
+# - data/generate/: sessions.csv, the only input detectors and the
+#   investigator may read.
+# - data/truth/: labels.csv and incident_truth.json, for evaluation only.
+# Each stage has a manifest.json recording file hashes, the seed, software
+# versions, and the hash of this script.
+#
 # SOURCES
 # Cohort sizes and most behaviour parameters follow the SAD-Lite reference
 # implementation (sadlite/generate_sessions.py). Departures from it are marked
@@ -105,7 +113,10 @@ from datetime import datetime, timedelta, timezone
 import csv
 from pathlib import Path
 from collections import Counter
+import io
 import json
+
+import provenance
 
 
 # ------------------------------------------------------------
@@ -1336,6 +1347,17 @@ def check_dataset(sessions, labels):
                 raise ValueError(f"{user_id} has overlapping sessions")
 
 
+def rows_to_csv_bytes(rows, fieldnames):
+    """Serialise session or label rows to the exact CSV bytes that will be published."""
+
+    buffer = io.StringIO(newline="")
+    writer = csv.DictWriter(buffer, fieldnames=fieldnames)
+    writer.writeheader()
+    writer.writerows(rows)
+
+    return buffer.getvalue().encode("utf-8")
+
+
 def build_dataset(seed=42, days=30, include_incident=True):
     """Generate and check the full dataset in memory, without writing files.
 
@@ -1379,28 +1401,40 @@ def main():
     print(f"Termination rate for this game outside the window: {incident['baseline_termination_rate']:.1%}")
 
     # Resolve paths relative to this file, regardless of terminal location.
-    output_dir = Path(__file__).resolve().parent / "data"
-    output_dir.mkdir(parents=True, exist_ok=True)
+    data_dir = Path(__file__).resolve().parent / "data"
 
-    with (output_dir / "incident_truth.json").open("w", encoding="utf-8") as file:
-        json.dump(incident, file, indent=2)
+    settings = {"seed": args.seed, "account_counts": ACCOUNT_COUNTS}
 
-    with (output_dir / "sessions.csv").open("w", newline="", encoding="utf-8") as file:
-        writer = csv.DictWriter(file, fieldnames=SESSION_FIELDS)
-        writer.writeheader()
-        writer.writerows(sessions)
+    # Detection inputs and ground truth are separate stages, so a detector or
+    # the investigator can be given one without the other.
+    sessions_bytes = rows_to_csv_bytes(sessions, SESSION_FIELDS)
 
-    with (output_dir / "labels.csv").open("w", newline="", encoding="utf-8") as file:
-        writer = csv.DictWriter(file, fieldnames=["user_id", "label", "pattern"])
-        writer.writeheader()
-        writer.writerows(labels)
+    provenance.publish_stage(
+        data_dir, "generate",
+        files={"sessions.csv": sessions_bytes},
+        inputs={},
+        settings=settings,
+        code_path=__file__,
+    )
+
+    provenance.publish_stage(
+        data_dir, "truth",
+        files={
+            "labels.csv": rows_to_csv_bytes(labels, ["user_id", "label", "pattern"]),
+            "incident_truth.json": json.dumps(incident, indent=2).encode("utf-8"),
+        },
+        # Binds the answer key to the exact sessions it describes.
+        inputs={"sessions": provenance.input_record("generate", "sessions.csv", provenance.sha256_bytes(sessions_bytes))},
+        settings=settings,
+        code_path=__file__,
+    )
 
     abusive = sum(row["label"] for row in labels)
 
     print(f"\nSeed: {args.seed}")
     print(f"Generated {len(sessions):,} sessions for {len(labels):,} accounts")
     print(f"Accounts labelled abusive: {abusive} ({abusive / len(labels):.1%})")
-    print(f"Files saved in: {output_dir}")
+    print(f"Stages published in: {data_dir} (generate/, truth/)")
 
     print("\nAccounts per scenario:")
     for pattern, count in sorted(Counter(row["pattern"] for row in labels).items()):

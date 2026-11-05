@@ -17,13 +17,16 @@ How Isolation Forest works:
 Reference: Liu, Ting & Zhou, "Isolation Forest", ICDM 2008.
 
 What this file does:
-- Loads and validates the account summaries from features.csv.
+- Loads and validates the account summaries from the published features
+  stage, hashing and validating the same bytes (see provenance.py).
 - Selects behaviour features and handles documented missing values.
 - Fits Isolation Forest using a fixed random seed for reproducibility.
 - Gives each account an anomaly score, with higher scores meaning
   more unusual behaviour.
-- Saves ranked accounts to model_scores.csv.
-- Saves the settings and feature choices used for the run.
+- Publishes the ranking and the settings used as data/model/, with a
+  manifest recording the features it was built from.
+- Does not save the fitted model: re-fitting from the recorded settings
+  reproduces the scores, and loading a pickled model executes code.
 
 Feature choices:
 - Rates, diversity, regularity, outcomes, account age, and the entity
@@ -53,6 +56,7 @@ implementation (sadlite/score_model.py), without its standardisation step.
 
 import argparse
 import hashlib
+import io
 import json
 from pathlib import Path
 
@@ -61,6 +65,8 @@ import pandas as pd
 import sklearn
 from sklearn.ensemble import IsolationForest
 
+import provenance
+
 # Features that may be undefined, and why (see features.py).
 OPTIONAL_COLUMNS = ["input_cv", "duration_cv", "termination_game_concentration"]
 
@@ -68,13 +74,20 @@ OPTIONAL_COLUMNS = ["input_cv", "duration_cv", "termination_game_concentration"]
 MIN_TERMINATIONS_FOR_CONCENTRATION = 3
 
 
-def load_features(file_path):
-    """Load and validate one feature row per account."""
+def load_features(source):
+    """Load and validate one feature row per account.
 
-    file_path = Path(file_path)
+    source is either a file path or CSV bytes that were already read and
+    hashed (see provenance.py), so the validated data is the hashed data.
+    """
 
-    if not file_path.is_file():
-        raise FileNotFoundError(f"Feature file not found: {file_path}")
+    if isinstance(source, (bytes, bytearray)):
+        csv_source = io.BytesIO(source)
+    else:
+        csv_source = Path(source)
+
+        if not csv_source.is_file():
+            raise FileNotFoundError(f"Feature file not found: {csv_source}")
 
     count_columns = [
         "session_count", "active_days", "max_sessions_per_day",
@@ -96,7 +109,7 @@ def load_features(file_path):
     numeric_columns = count_columns + measurement_columns
     expected_columns = ["user_id"] + numeric_columns
 
-    data = pd.read_csv(file_path, dtype={"user_id": "string"})
+    data = pd.read_csv(csv_source, dtype={"user_id": "string"})
 
     if data.empty:
         raise ValueError("Feature table contains no accounts.")
@@ -376,8 +389,11 @@ def calculate_anomaly_scores(model, prepared_features):
 
     return pd.Series(scores, index=prepared_features.index, name="anomaly_score")
 
-def rank_and_save_scores(data, anomaly_scores, output_path):
-    """Rank accounts by anomaly score and save the results to CSV."""
+def rank_and_save_scores(data, anomaly_scores, output_path=None):
+    """Rank accounts by anomaly score, saving to CSV only if a path is given.
+
+    main() publishes the ranking as a stage instead (see provenance.py).
+    """
 
     if data.empty:
         raise ValueError("Cannot rank an empty account table.")
@@ -408,9 +424,10 @@ def rank_and_save_scores(data, anomaly_scores, output_path):
     ranked = ranked.drop(columns="tie_breaker")
     ranked.insert(0, "rank", np.arange(1, len(ranked) + 1))
 
-    output_path = Path(output_path)
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-    ranked.to_csv(output_path, index=False)
+    if output_path is not None:
+        output_path = Path(output_path)
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        ranked.to_csv(output_path, index=False)
 
     return ranked
 
@@ -447,25 +464,27 @@ def main():
 
     project_dir = Path(__file__).resolve().parent
     data_dir = project_dir / "data"
-    reports_dir = project_dir / "reports"
 
     parser = argparse.ArgumentParser(description="Rank accounts with an Isolation Forest.")
     parser.add_argument("--seed", type=int, default=42, help="random seed for the forest; record it in any write-up")
-    parser.add_argument("--output", type=Path, default=data_dir / "model_scores.csv", help="where to save the ranking")
+    parser.add_argument("--stage", default="model", help="stage name to publish the ranking under")
     parser.add_argument("--top", type=int, default=15, help="how many accounts to print")
     args = parser.parse_args()
 
-    features_path = data_dir / "features.csv"
-    settings_path = reports_dir / f"model_settings_{args.output.stem}.json"
+    # Read the published features once; hash and validate the same bytes.
+    manifest, contents = provenance.load_stage(data_dir, "features", ["features.csv"])
+    features_bytes = contents["features.csv"]
 
-    # Load features and prepare numeric model inputs.
-    data = load_features(features_path)
+    data = load_features(features_bytes)
 
     # Fit the model and score the same accounts for our initial comparison.
     anomaly_scores, model, model_features, prepared_features, fill_values = score_accounts(data, random_state=args.seed)
-    ranked = rank_and_save_scores(data, anomaly_scores, args.output)
+    ranked = rank_and_save_scores(data, anomaly_scores)
 
     # Record the settings and preprocessing choices used for this run.
+    # The fitted model itself is not saved: re-fitting from these settings
+    # reproduces the scores, and loading a saved (pickled) model would let
+    # anyone who can write that file run code in whatever loads it.
     settings = {
         "model_type": "IsolationForest",
         "model_parameters": model.get_params(),
@@ -481,14 +500,18 @@ def main():
         "evaluation_scope": "Model fitted and scored on the same synthetic accounts.",
     }
 
-    reports_dir.mkdir(parents=True, exist_ok=True)
+    provenance.publish_stage(
+        data_dir, args.stage,
+        files={
+            "model_scores.csv": provenance.frame_to_bytes(ranked),
+            "model_settings.json": json.dumps(settings, indent=4, allow_nan=False).encode("utf-8"),
+        },
+        inputs={"features": provenance.input_record("features", "features.csv", provenance.sha256_bytes(features_bytes))},
+        settings=settings,
+        code_path=__file__,
+    )
 
-    with settings_path.open("w", encoding="utf-8") as file:
-        json.dump(settings, file, indent=4, allow_nan=False)
-
-    display_results(ranked, args.output, top_n=args.top)
-
-    print(f"Model settings saved to: {settings_path}")
+    display_results(ranked, data_dir / args.stage, top_n=args.top)
     print("Initial comparison: fitted and scored on the same synthetic dataset.")
 
 

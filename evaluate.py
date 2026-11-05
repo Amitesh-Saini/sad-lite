@@ -8,13 +8,16 @@
 # accounts they incorrectly put in front of a reviewer.
 #
 # INPUTS
-# - data/rule_scores.csv: rule scores, review recommendations, and evidence.
-# - data/model_scores.csv: Isolation Forest anomaly scores.
-# - data/labels.csv: known labels and generated scenarios.
+# Published stages, each verified against its manifest, and the chain between
+# them checked: features from these sessions, scores from these features
+# (see provenance.py for what this does and does not guarantee).
+# - data/rules/rule_scores.csv: rule scores, review recommendations, and evidence.
+# - data/model/model_scores.csv: Isolation Forest anomaly scores.
+# - data/truth/labels.csv: known labels and generated scenarios.
 #   Label 0 = innocent; label 1 = synthetic abuse.
-# - data/incident_truth.json: the game incident and its participants.
+# - data/truth/incident_truth.json: the game incident and its participants.
 # - config/rules.yaml: the review capacity (K).
-# - data/features.csv: only to re-score for the experiment and seed checks.
+# - data/features/features.csv: only to re-score for the experiment and seed checks.
 #
 # WHY THIS IS NEEDED
 # Producing suspiciousness scores does not establish that detection works.
@@ -64,6 +67,7 @@
 
 import argparse
 import hashlib
+import io
 import json
 from pathlib import Path
 
@@ -73,6 +77,7 @@ import yaml
 from sklearn.metrics import average_precision_score
 from datetime import datetime, timezone
 
+import provenance
 import score_model
 import score_rules
 
@@ -252,6 +257,38 @@ def load_review_capacity(config_path):
     score_rules.validate_config(config)
 
     return int(config["review"]["capacity"])
+
+
+def load_verified_stages(data_dir):
+    """Verify every stage evaluation reads, and the chain between them.
+
+    Returns the verified bytes of each file. Raises provenance.ProvenanceError
+    if any stage is missing, incomplete, altered, or built from a different run.
+    """
+
+    generate, generate_files = provenance.load_stage(data_dir, "generate", ["sessions.csv"])
+    features, features_files = provenance.load_stage(data_dir, "features", ["features.csv"])
+    rules, rules_files = provenance.load_stage(data_dir, "rules", ["rule_scores.csv", "rules_config.yaml"])
+    model, model_files = provenance.load_stage(data_dir, "model", ["model_scores.csv", "model_settings.json"])
+    truth, truth_files = provenance.load_stage(data_dir, "truth", ["labels.csv", "incident_truth.json"])
+
+    sessions_digest = provenance.sha256_bytes(generate_files["sessions.csv"])
+    features_digest = provenance.sha256_bytes(features_files["features.csv"])
+
+    provenance.check_input(features, "sessions", "generate", "sessions.csv", sessions_digest)
+    provenance.check_input(rules, "features", "features", "features.csv", features_digest)
+    provenance.check_input(model, "features", "features", "features.csv", features_digest)
+
+    # The answer key must describe exactly these sessions.
+    provenance.check_input(truth, "sessions", "generate", "sessions.csv", sessions_digest)
+
+    return {
+        "features": features_files["features.csv"],
+        "rule_scores": rules_files["rule_scores.csv"],
+        "model_scores": model_files["model_scores.csv"],
+        "labels": truth_files["labels.csv"],
+        "incident": truth_files["incident_truth.json"],
+    }
 
 
 def count_outcomes(data):
@@ -767,15 +804,16 @@ def main():
 
     k = load_review_capacity(args.config)
 
-    labels = load_labels(data_dir / "labels.csv")
-    rule_data = load_evaluation_data(data_dir / "rule_scores.csv", data_dir / "labels.csv")
-    model_data = load_evaluation_data(data_dir / "model_scores.csv", data_dir / "labels.csv", score_column="anomaly_score")
+    stages = load_verified_stages(data_dir)
+
+    labels = load_labels(io.BytesIO(stages["labels"]))
+    rule_data = join_labels(load_scores(io.BytesIO(stages["rule_scores"])), labels)
+    model_data = join_labels(load_scores(io.BytesIO(stages["model_scores"]), score_column="anomaly_score"), labels)
 
     if set(rule_data["user_id"]) != set(model_data["user_id"]):
         raise ValueError("Rules and model results must contain the same accounts.")
 
-    with (data_dir / "incident_truth.json").open(encoding="utf-8") as file:
-        incident = json.load(file)
+    incident = json.loads(stages["incident"].decode("utf-8"))
 
     budgets = sorted(set(BUDGETS) | {k})
 
@@ -892,7 +930,7 @@ def main():
            f"bad session, so user-level detection should not single them out.")
 
     # --- Shared-IP experiment -----------------------------------------------
-    feature_table = score_rules.validate_features(pd.read_csv(data_dir / "features.csv"))
+    feature_table = score_rules.validate_features(provenance.frame_from_bytes(stages["features"]))
     experiment = None
 
     if args.experiment_config.exists():
@@ -906,7 +944,7 @@ def main():
     seed_spread = None
 
     if args.seeds > 0:
-        model_feature_data = score_model.load_features(data_dir / "features.csv")
+        model_feature_data = score_model.load_features(stages["features"])
         seed_runs, seed_spread = seed_stability(model_feature_data, labels, rule_data, k, list(range(args.seeds)))
         banner(f"Model stability across {args.seeds} forest seeds", summary_lines, seed_spread,
                "Measures with a narrow range are findings; measures with a wide range depend on the seed.")

@@ -2,8 +2,10 @@
 # SAD-Lite — Rule-Based Account Scoring
 # =============================================================================
 #
-# Reads data/features.csv and configurable thresholds from config/rules.yaml.
-# Produces ranked accounts with scores, evidence, and alternative explanations.
+# Reads data/features/features.csv and configurable thresholds from
+# config/rules.yaml. Produces ranked accounts with scores, evidence, and
+# alternative explanations, published as data/rules/ with the exact
+# configuration used and a manifest of input hashes (see provenance.py).
 #
 # HOW A RULE SCORES
 # Every rule reads one feature and turns it into a signal between 0 and 1:
@@ -53,6 +55,8 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 import yaml
+
+import provenance
 
 
 # Created as config/rules.yaml on the first run.
@@ -467,38 +471,55 @@ def feature_distributions(features):
 
 def main():
     root = Path(__file__).resolve().parent
+    data_dir = root / "data"
 
     parser = argparse.ArgumentParser(description="Score accounts with weighted, explainable rules.")
     parser.add_argument("--config", type=Path, default=root / "config" / "rules.yaml", help="rule configuration to use")
-    parser.add_argument("--output", type=Path, default=root / "data" / "rule_scores.csv", help="where to save the ranking")
+    parser.add_argument("--stage", default="rules", help="stage name to publish the ranking under, e.g. rules_shared_ip_raised")
     parser.add_argument("--top", type=int, default=15, help="how many accounts to print")
     args = parser.parse_args()
 
-    config = load_config(args.config)
-    features = validate_features(pd.read_csv(root / "data" / "features.csv"))
+    # Create the default configuration on the first run.
+    if not args.config.exists():
+        load_config(args.config)
+
+    # Read the configuration once; hash and parse the same bytes.
+    config_bytes, config_digest = provenance.read_verified(args.config)
+    config = yaml.safe_load(config_bytes.decode("utf-8"))
+    validate_config(config)
+
+    manifest, contents = provenance.load_stage(data_dir, "features", ["features.csv"])
+    features_bytes = contents["features.csv"]
+
+    features = validate_features(provenance.frame_from_bytes(features_bytes))
     scores = score_features(features, config)
+
+    # The ranking and the exact configuration that produced it are published together.
+    provenance.publish_stage(
+        data_dir, args.stage,
+        files={
+            "rule_scores.csv": provenance.frame_to_bytes(scores),
+            "rules_config.yaml": config_bytes,
+        },
+        inputs={
+            "features": provenance.input_record("features", "features.csv", provenance.sha256_bytes(features_bytes)),
+            "config": {"file": args.config.name, "sha256": config_digest},
+        },
+        settings={"config_file": args.config.name},
+        code_path=__file__,
+    )
 
     reports = root / "reports"
     reports.mkdir(parents=True, exist_ok=True)
 
-    args.output.parent.mkdir(parents=True, exist_ok=True)
-    scores.to_csv(args.output, index=False)
-
     feature_distributions(features).to_csv(reports / "feature_distributions.csv")
-
-    # Save the exact settings used to produce this ranking.
-    snapshot = reports / f"rules_used_{args.output.stem}.yaml"
-
-    with snapshot.open("w", encoding="utf-8") as file:
-        yaml.safe_dump(config, file, sort_keys=False)
 
     pd.set_option("display.max_colwidth", 110)
     print(scores[["rank", "user_id", "rule_score", "evidence_summary"]].head(args.top).to_string(index=False, float_format=lambda value: f"{value:.3f}"))
     print(f"\nScored {len(scores)} accounts with {args.config.name}; {int(scores.review_recommended.sum())} meet the review threshold.")
     print(f"Review capacity: {config['review']['capacity']} accounts.")
-    print(f"Ranking saved to: {args.output}")
+    print(f"Stage published: {data_dir / args.stage} (rule_scores.csv, rules_config.yaml, manifest.json)")
     print(f"Distribution statistics saved to: {reports / 'feature_distributions.csv'}")
-    print(f"Configuration snapshot saved to: {snapshot}")
     print("Scores are review priorities, not probabilities or enforcement decisions.")
 
 
