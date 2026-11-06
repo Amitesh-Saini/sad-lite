@@ -1358,12 +1358,14 @@ def rows_to_csv_bytes(rows, fieldnames):
     return buffer.getvalue().encode("utf-8")
 
 
-def build_dataset(seed=42, days=30, include_incident=True):
+def build_dataset(seed=42, days=30, include_incident=True, incident_start_hours=22 * 24 + 18):
     """Generate and check the full dataset in memory, without writing files.
 
     include_incident=False produces the identical dataset minus the incident
     surge: the incident uses its own random generator, so every other session
     is unchanged. Tests compare the two to measure the incident's own effect.
+    incident_start_hours (from the simulation start) lets tests place the
+    incident across window boundaries; the default is day 22, 18:00 UTC.
     """
 
     simulation_start = datetime(2026, 1, 1, tzinfo=timezone.utc)
@@ -1376,7 +1378,7 @@ def build_dataset(seed=42, days=30, include_incident=True):
     if include_incident:
         # Day 22 of the simulation (counting from day 0, i.e. 23 January),
         # from 18:00 to midnight UTC.
-        incident_start = simulation_start + timedelta(days=22, hours=18)
+        incident_start = simulation_start + timedelta(hours=incident_start_hours)
         incident = inject_game_incident(sessions, labels, random.Random(seed + 1), incident_start, used_ids)
 
     assign_session_ids(sessions)

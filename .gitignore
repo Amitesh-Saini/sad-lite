@@ -9,3 +9,6 @@ reports/
 
 # Local enforcement decisions and evidence bundles (generated)
 enforcement/
+
+# run_all.sh lock (removed on exit)
+.run_all.lock/

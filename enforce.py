@@ -141,6 +141,9 @@ REVERSAL_CODES = {
 
 SUPPORTING_CONFIDENCE = {"Moderate", "Strong"}
 
+# Higher is stronger; used to order supported reasons (pipeline_demo.py's preview).
+CONFIDENCE_RANK = {"Strong": 2, "Moderate": 1}
+
 REQUIRED_STAGES = ["generate", "features", "rules", "model"]
 
 MIN_NOTES_LENGTH = 20
@@ -738,6 +741,26 @@ def duplicate_or_conflict(entries, request_key, request_sha256):
 # ------------------------------------------------------------
 # Ban.
 # ------------------------------------------------------------
+
+def supported_reasons(report):
+    """Ban codes the report supports at Moderate or above, strongest first.
+
+    Uses the structured hypotheses, the same code-to-hypothesis mapping, and
+    the same threshold as ban(). Ties at equal confidence are broken by the
+    code's alphabetical order, so the selection is deterministic. Supporting a
+    reason is not a decision: ban() still verifies the report and a person
+    still decides.
+    """
+
+    by_name = {}
+
+    for item in report.get("hypotheses", []):
+        by_name.setdefault(item.get("name"), item.get("confidence"))  # first match, as ban() uses
+    supported = [(code, by_name[name]) for code, name in BAN_CODES.items()
+                 if by_name.get(name) in SUPPORTING_CONFIDENCE]
+
+    return sorted(supported, key=lambda pair: (-CONFIDENCE_RANK[pair[1]], pair[0]))
+
 
 def ban(report_path, data_dir, user_id, reason, reviewer, notes, request_key=None, apply=False,
         override_justification=None, enforcement_dir=ROOT / "enforcement"):

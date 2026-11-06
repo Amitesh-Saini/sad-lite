@@ -14,7 +14,8 @@
 # DEFINITIONS
 # - A session belongs to a window by its session_end, with [start, end)
 #   boundaries, for both the session count and the termination count.
-# - A termination is end_reason terminated_anticheat or terminated_abuse.
+# - A termination is end_reason terminated_anticheat. Abuse terminations
+#   (terminated_abuse) come from a different process and are not counted.
 # - Windows end on check times anchored to UTC midnight of the first day in
 #   the data, every check_interval_hours. Only full windows are evaluated.
 #   Every window is evaluated, not only each game's busiest one.
@@ -56,7 +57,9 @@ import numpy as np
 import pandas as pd
 
 
-TERMINATED_ENDINGS = ("terminated_anticheat", "terminated_abuse")
+# Only anti-cheat terminations: the disarm control pauses anti-cheat enforcement,
+# and abuse terminations come from a different enforcement process.
+ANTICHEAT_ENDING = "terminated_anticheat"
 
 
 def prepare_sessions(sessions):
@@ -66,7 +69,7 @@ def prepare_sessions(sessions):
         "session_uuid": sessions["session_uuid"].astype(str),
         "app_id": sessions["app_id"].astype(str),
         "end": pd.to_datetime(sessions["session_end"], format="ISO8601", utc=True),
-        "terminated": sessions["end_reason"].isin(TERMINATED_ENDINGS).to_numpy(),
+        "terminated": (sessions["end_reason"] == ANTICHEAT_ENDING).to_numpy(),
     })
 
     if table["end"].isna().any():
@@ -83,8 +86,10 @@ def check_times(sessions, window_hours, check_interval_hours):
 
     times = []
     current = first_day + timedelta(hours=window_hours)
+    # At least one window, even when every session ends inside the first one.
+    stop = max(last + timedelta(hours=check_interval_hours), current)
 
-    while current <= last + timedelta(hours=check_interval_hours):
+    while current <= stop:
         times.append(current)
         current += timedelta(hours=check_interval_hours)
 
@@ -159,6 +164,7 @@ def evaluate_game(sessions, app_id, settings, times=None):
             # Thresholds met but the baseline cannot support a proposal.
             "insufficient_baseline_alert": absolute and not sufficient,
             "session_ids": ids[low:high],
+            "terminated_session_ids": ids[low:high][terminated[low:high]],
         })
 
     return windows, episodes_from(windows)

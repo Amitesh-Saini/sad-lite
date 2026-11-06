@@ -34,7 +34,7 @@ defaults:
   min_baseline_sessions: 100
   baseline_multiplier: 5.0
   # Calibrated on incident-free data (see the calibration block below).
-  termination_rate_threshold: 0.15
+  termination_rate_threshold: 0.05
   baseline_floor_rate: 0.0132
 
 calibration:
@@ -42,10 +42,11 @@ calibration:
   floor_rule: "Median observed baseline rate across 41,728 calibration windows with a sufficient baseline."
   threshold_rule: "Lowest value on the grid 0.05-0.60 (step 0.05) whose false alert episodes stay within budget."
   budget: "At most one alert episode per 30 days across all games: 5 across the 5 seeds."
-  result: "0.15 gave 3 false episodes, all on the first day before 100 baseline sessions existed (insufficient baseline, so no disarm proposal); 0.10 gave 8."
-  held_out_check: "Seeds 42, 1, 7: incident detected at all three, proposal-eligible; no proposal-eligible alert outside the incident, with or without it."
+  counted: "Anti-cheat terminations only (terminated_anticheat); abuse terminations come from a different process."
+  result: "0.05, the lowest grid value, gave 4 false episodes, all on the first day before 100 baseline sessions existed (insufficient baseline, so no disarm proposal). With the baseline floor and the 5x multiplier, the relative condition is the binding one."
+  held_out_check: "Seeds 42, 1, 7: incident detected at all three, proposal-eligible; no proposal-eligible alert outside the incident, with or without it. Each seed also has 2-3 first-day insufficient-baseline alerts on Harbour Siege or Vanta Rally, which exceeds the one-per-30-days budget at seed 1; they are review-only and cannot produce a proposal."
   limits: "Behaviour on SAD-Lite's own generator only, not on real traffic."
-  record: "reports/calibration/20261106_123409_UTC/calibration.json"
+  record: "reports/calibration/20261106_124956_UTC/calibration.json (regenerate with python calibrate_games.py)"
 
 games:
   - app_id: "app_1001"

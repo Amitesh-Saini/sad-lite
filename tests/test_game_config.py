@@ -122,12 +122,12 @@ def test_counts_must_be_real_integers():
 
 
 def test_rates_must_be_finite_and_within_range():
-    rejected(changed("  termination_rate_threshold: 0.15\n", "  termination_rate_threshold: 1.5\n"), "between 0 and 1")
+    rejected(changed("  termination_rate_threshold: 0.05\n", "  termination_rate_threshold: 1.5\n"), "between 0 and 1")
     rejected(changed("  baseline_floor_rate: 0.0132\n", "  baseline_floor_rate: -0.01\n"), "between 0 and 1")
-    rejected(changed("  termination_rate_threshold: 0.15\n", "  termination_rate_threshold: .nan\n"), "finite number")
+    rejected(changed("  termination_rate_threshold: 0.05\n", "  termination_rate_threshold: .nan\n"), "finite number")
     rejected(changed("  baseline_multiplier: 5.0\n", "  baseline_multiplier: .inf\n"), "finite number")
     rejected(changed("  baseline_multiplier: 5.0\n", "  baseline_multiplier: 0.5\n"), "at least 1")
-    rejected(changed("  termination_rate_threshold: 0.15\n", "  termination_rate_threshold: false\n"), "finite number")
+    rejected(changed("  termination_rate_threshold: 0.05\n", "  termination_rate_threshold: false\n"), "finite number")
 
 
 def test_cross_field_rules():
