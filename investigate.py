@@ -59,10 +59,15 @@
 # not statistically independent: one household can produce shared payments,
 # devices, and IPs at once. Each hypothesis therefore names its most plausible
 # common-cause innocent explanation explicitly.
-# - Strong: the main innocent explanations were each contradicted by a check.
-# - Moderate: some, but not all, were contradicted.
-# - Weak: the pattern is present, but innocent explanations remain open.
+# - Strong: every competing innocent explanation was contradicted by a check.
+# - Moderate: at least one was contradicted, or two or more distinct
+#   supporting patterns were observed while every explanation stays open.
+# - Weak: the pattern is present; innocent explanations remain open.
 # - Insufficient: too few observations to judge.
+# Patterns that usually share one cause (a shared device and a shared
+# payment) count once. Cheating and automation are capped at Moderate from
+# session data alone: the decisive evidence (anti-cheat detection details,
+# per-input timing) is not in the session log.
 #
 # TRACEABILITY AND REPRODUCIBILITY
 # Every observation cites its supporting session IDs (up to a limit, with the
@@ -117,7 +122,7 @@ import provenance
 import score_rules
 
 
-INVESTIGATOR_VERSION = "1.0.0"
+INVESTIGATOR_VERSION = "1.1.0"
 REPORT_SCHEMA_VERSION = 1
 
 # The only stages and files this tool may read.
@@ -177,6 +182,15 @@ SETTINGS = {
     "round_the_clock_hours": 18,
     "cheating_min_terminations": 3,
     "cheating_min_rate": 0.15,
+    # A rate this high, outside any game-wide spike, is a further supporting pattern.
+    "cheating_high_rate": 0.30,
+    # Terminations on at least this many separate days are a further supporting pattern.
+    "cheating_min_days": 3,
+    # Devices first observed after this early period, clustered within the window.
+    # A stated assumption: one person rarely starts using two further devices that close together.
+    "early_period_days": 7,
+    "late_device_cluster_days": 3,
+    "late_device_cluster_min": 2,
     "shared_network_min_other_accounts": 10,
     "vpn_exit_min_other_accounts": 5,
 }
@@ -587,12 +601,46 @@ def account_observations(account, sessions, windows, observations):
     if pairs:
         observations.add(
             "timing", "account_overlap",
-            f"{len(pairs)} pairs of this account's sessions overlap in time, {len(different_devices)} of them on different devices.",
+            f"{len(pairs)} pairs of this account's sessions have overlapping recorded times, {len(different_devices)} of them on "
+            f"different devices. Overlapping records do not by themselves establish simultaneous active play: a client left "
+            f"running, a late session end, or a device-ID error produce the same record.",
             "session pairs with start_A < end_B and start_B < end_A",
             [a["session_uuid"] for a, _ in pairs] + [b["session_uuid"] for _, b in pairs],
             len(pairs),
             details=[{"first": a["session_uuid"], "second": b["session_uuid"], "different_devices": a["device_id"] != b["device_id"]}
                      for a, b in pairs[:SETTINGS["session_ids_cited"]]],
+        )
+
+    # Countries within one UTC day.
+    per_day = known.groupby(known["start"].dt.floor("D"))["country"].nunique()
+    facts["max_countries_per_day"] = int(per_day.max()) if len(per_day) else 0
+
+    # Devices first observed in this data after the account's early period.
+    # "First observed" is not "newly acquired": the data only shows first use here.
+    first_seen = own.groupby("device_id")["start"].min().sort_values()
+    early_end = own["start"].min() + timedelta(days=SETTINGS["early_period_days"])
+    late = first_seen[first_seen > early_end]
+
+    cluster = []
+
+    for device, seen in late.items():
+        window = late[(late >= seen) & (late <= seen + timedelta(days=SETTINGS["late_device_cluster_days"]))]
+
+        if len(window) > len(cluster):
+            cluster = list(window.index)
+
+    facts["late_device_cluster"] = cluster if len(cluster) >= SETTINGS["late_device_cluster_min"] else []
+
+    if facts["late_device_cluster"]:
+        cluster_sessions = own[own["device_id"].isin(facts["late_device_cluster"])]
+        observations.add(
+            "diversity", "late_device_cluster",
+            f"{len(facts['late_device_cluster'])} devices were first observed in this data within "
+            f"{SETTINGS['late_device_cluster_days']} days of each other, after the account's first "
+            f"{SETTINGS['early_period_days']} days. First observed here does not mean newly acquired.",
+            "per device: earliest session_start; devices first observed after the early period, largest group within the window",
+            cluster_sessions["session_uuid"], len(facts["late_device_cluster"]),
+            details=[{"device_id": device, "first_observed": stamp(first_seen[device])} for device in facts["late_device_cluster"]],
         )
 
     # --- Outcomes ---------------------------------------------------------------
@@ -604,6 +652,10 @@ def account_observations(account, sessions, windows, observations):
     contexts = [termination_context(row, windows) for row in terminated.to_dict("records")]
     facts["termination_contexts"] = contexts
     facts["terminated_games"] = terminated["game_name"].value_counts().sort_index().to_dict()
+
+    # Separate UTC days with a termination outside any elevated game-wide period.
+    outside_ids = {item["session_id"] for item in contexts if not item["elevated"]}
+    facts["termination_days_outside_spikes"] = int(terminated[terminated["session_uuid"].isin(outside_ids)]["start"].dt.floor("D").nunique())
 
     if len(terminated):
         games = ", ".join(f"{md(game)} ({count})" for game, count in sorted(facts["terminated_games"].items()))
@@ -839,7 +891,7 @@ def build_timeline(own, facts):
                 seen[column].add(value)
 
                 if len(seen[column]) > 1:
-                    events.append((row["start"], 2, f"first use of {label} {md(value)}", row["session_uuid"]))
+                    events.append((row["start"], 2, f"first observed use of {label} {md(value)}", row["session_uuid"]))
 
         if row["terminated"]:
             events.append((row["start"], 3, f"{row['end_reason']} on {md(row['game_name'])}", row["session_uuid"]))
@@ -866,18 +918,44 @@ def build_timeline(own, facts):
 # Hypotheses.
 # ------------------------------------------------------------
 
-def judge(alternatives):
-    """Turn the result of each check against an innocent explanation into a confidence."""
+CONFIDENCE_ORDER = ["Insufficient", "Weak", "Moderate", "Strong"]
+
+
+def judge(alternatives, patterns=(), cap=None, cap_reason=None):
+    """Turn observed supporting patterns and alternative checks into a confidence.
+
+    patterns: the distinct supporting patterns observed, beyond whatever
+    triggered the hypothesis. alternatives: each competing innocent explanation
+    with the result of the check made against it.
+
+    - Strong: every alternative was contradicted by a check.
+    - Moderate: at least one alternative was contradicted, or two or more
+      distinct supporting patterns were observed with alternatives unresolved.
+    - Weak: the pattern is present; alternatives remain open.
+    A cap limits the result when the decisive evidence is not in the session log.
+    """
 
     contradicted = sum(1 for item in alternatives if item["result"] == "contradicted")
+    patterns = list(patterns)
 
-    if contradicted == len(alternatives):
-        return "Strong", "every competing innocent explanation was contradicted by a check in the data"
+    if alternatives and contradicted == len(alternatives):
+        level = "Strong"
+        basis = "every competing innocent explanation was contradicted by a check in the data"
+    elif contradicted:
+        level = "Moderate"
+        basis = f"{contradicted} of {len(alternatives)} competing innocent explanations were contradicted; the rest remain possible"
+    elif len(patterns) >= 2:
+        level = "Moderate"
+        basis = f"{len(patterns)} distinct supporting patterns ({'; '.join(patterns)}), but every innocent explanation remains possible"
+    else:
+        level = "Weak"
+        basis = "the pattern is present, but no competing innocent explanation was ruled out"
 
-    if contradicted:
-        return "Moderate", f"{contradicted} of {len(alternatives)} competing innocent explanations were contradicted; the rest remain possible"
+    if cap is not None and CONFIDENCE_ORDER.index(level) > CONFIDENCE_ORDER.index(cap):
+        level = cap
+        basis = f"{basis}; capped at {cap} because {cap_reason}"
 
-    return "Weak", "the pattern is present, but no competing innocent explanation was contradicted"
+    return level, basis
 
 
 def find_observation(observations, kind):
@@ -902,7 +980,7 @@ def account_hypotheses(facts, connections, observations, percentiles):
         alternatives = [
             {
                 "explanation": "A household or family sharing a console and a payment card.",
-                "check": f"More than {SETTINGS['household_max_accounts']} accounts on the shared identifiers (an assumption about household size)",
+                "check": f"More than {SETTINGS['household_max_accounts']} accounts on the shared identifiers (a stated assumption about household size)",
                 "result": "contradicted" if group_size > SETTINGS["household_max_accounts"] else "not contradicted",
                 "observed": f"{group_size} accounts",
             },
@@ -914,7 +992,9 @@ def account_hypotheses(facts, connections, observations, percentiles):
             },
         ]
 
-        confidence, basis = judge(alternatives)
+        # A shared device and a shared payment usually have one cause, so they
+        # count as a single supporting pattern, not two.
+        confidence, basis = judge(alternatives, patterns=["shared device and payment"])
 
         hypotheses.append({
             "name": "Coordinated multi-accounting",
@@ -923,7 +1003,9 @@ def account_hypotheses(facts, connections, observations, percentiles):
                 f"{payment['other_accounts']}. No single link is conclusive; the combination with the checks below is the case."
             ),
             "families": ["entity_graph", "account_age"],
-            "supporting_observations": [item for item in [find_observation(observations, "account_age")] if item],
+            "supporting_observations": [item for item in [find_observation(observations, "shared_device_id"),
+                                                          find_observation(observations, "shared_payment_hash"),
+                                                          find_observation(observations, "account_age")] if item],
             "common_cause_alternative": alternatives[0]["explanation"],
             "alternatives": alternatives,
             "confidence": confidence,
@@ -932,51 +1014,61 @@ def account_hypotheses(facts, connections, observations, percentiles):
         })
 
     # --- Account sharing or resale ------------------------------------------
-    countries = len(facts["countries"])
-    overlaps_devices = len(facts["overlaps_different_devices"])
+    # Observed patterns that sharing would produce. None of them rules out an
+    # innocent explanation on its own, so they are support, not contradiction.
+    sharing_patterns = []
 
-    if countries >= 2 and (facts["rapid_changes"] or facts["devices"] >= 3 or overlaps_devices):
-        new_country_sessions = {item["to_session"] for item in facts["rapid_changes"]}
-        own_devices = facts["devices"]
+    if facts["overlaps_different_devices"]:
+        sharing_patterns.append(f"{len(facts['overlaps_different_devices'])} overlapping session records on different devices")
 
-        vpn_like = ip is not None and ip["other_accounts"] >= SETTINGS["vpn_exit_min_other_accounts"] and ip["others_sharing_more_than_this_identifier"] == 0
+    if facts["late_device_cluster"]:
+        sharing_patterns.append(f"{len(facts['late_device_cluster'])} devices first observed close together after the early period")
 
+    if facts["max_countries_per_day"] >= 2:
+        sharing_patterns.append(f"{facts['max_countries_per_day']} countries within one day")
+
+    if sharing_patterns:
         alternatives = [
             {
-                "explanation": "One person travelling with their own device.",
-                "check": "Sessions on different devices overlap in time, or three or more devices are used",
-                "result": "contradicted" if overlaps_devices or own_devices >= 3 else "not contradicted",
-                "observed": f"{overlaps_devices} overlapping pairs on different devices; {own_devices} devices",
+                "explanation": "One person travelling, playing on their own devices.",
+                "check": "Session data alone cannot rule this out; see the patterns listed in the basis",
+                "result": "not contradicted",
+                "observed": f"{len(facts['countries'])} countries, {facts['devices']} devices",
             },
             {
                 "explanation": "One person using a VPN that exits in another country.",
-                "check": "The account's most-shared IP is not a shared exit (shared with few unlinked accounts)",
-                "result": "not contradicted" if vpn_like else "contradicted",
+                "check": "Session data alone cannot rule this out; a VPN changes IP and country, not devices",
+                "result": "not contradicted",
                 "observed": (
-                    f"most-shared IP has {ip['other_accounts']} other accounts, {ip['others_sharing_more_than_this_identifier']} also linked otherwise"
-                    if ip else "no IP information"
+                    f"most-shared IP has {ip['other_accounts']} other accounts" if ip else "no IP information"
                 ),
+            },
+            {
+                "explanation": "A client left running, a late session end, or a device-ID error creating overlapping records.",
+                "check": "Session data alone cannot rule this out",
+                "result": "not contradicted",
+                "observed": f"{len(facts['overlaps_different_devices'])} overlapping pairs on different devices",
             },
         ]
 
-        confidence, basis = judge(alternatives)
+        confidence, basis = judge(alternatives, patterns=sharing_patterns)
 
         hypotheses.append({
             "name": "Account sharing or resale",
             "statement": (
-                f"The account was used from {countries} countries, with {len(facts['rapid_changes'])} rapid country changes, "
-                f"{own_devices} devices, and {overlaps_devices} overlapping pairs on different devices. "
-                f"A shared household or travel remains plausible unless the checks below rule them out."
+                "Patterns consistent with several people using this account: " + "; ".join(sharing_patterns) + ". "
+                "Travel, a VPN, and recording errors each remain possible; more evidence is needed."
             ),
             "families": ["geography", "diversity", "timing"],
-            "supporting_observations": [item for item in [find_observation(observations, "diversity"),
+            "supporting_observations": [item for item in [find_observation(observations, "account_overlap"),
+                                                          find_observation(observations, "late_device_cluster"),
                                                           find_observation(observations, "rapid_country_change"),
-                                                          find_observation(observations, "account_overlap")] if item],
+                                                          find_observation(observations, "diversity")] if item],
             "common_cause_alternative": alternatives[0]["explanation"],
             "alternatives": alternatives,
             "confidence": confidence,
             "confidence_basis": basis,
-            "next_check": "Check whether the new devices first appear in the same period as the new countries, and whether the account's owner reported travel.",
+            "next_check": "Check login and credential-change history around the period the further devices were first observed, and whether the owner reported travel.",
         })
 
     # --- Automation -----------------------------------------------------------
@@ -986,8 +1078,15 @@ def account_hypotheses(facts, connections, observations, percentiles):
 
     duration_low = duration_cv is not None and duration_cv <= SETTINGS["automation_max_duration_cv"]
     input_low = input_cv is not None and input_cv <= SETTINGS["automation_max_input_cv"]
+    round_the_clock = facts["distinct_hours"] >= SETTINGS["round_the_clock_hours"]
 
     if duration_low or input_low:
+        patterns = [label for flag, label in [
+            (duration_low, f"session-length CV {number(duration_cv)}"),
+            (input_low, f"input-rate CV {number(input_cv)}"),
+            (round_the_clock, f"play in {facts['distinct_hours']} distinct hours"),
+        ] if flag]
+
         alternatives = [
             {
                 "explanation": "A routine player or a platform session limit producing consistent session lengths.",
@@ -998,12 +1097,15 @@ def account_hypotheses(facts, connections, observations, percentiles):
             {
                 "explanation": "A heavy human player, such as a shift worker, playing at unusual hours.",
                 "check": f"Play spans at least {SETTINGS['round_the_clock_hours']} hours of the day while staying consistent",
-                "result": "contradicted" if facts["distinct_hours"] >= SETTINGS["round_the_clock_hours"] and duration_low and input_low else "not contradicted",
+                "result": "contradicted" if round_the_clock and duration_low and input_low else "not contradicted",
                 "observed": f"{facts['distinct_hours']} distinct hours",
             },
         ]
 
-        confidence, basis = judge(alternatives)
+        confidence, basis = judge(
+            alternatives, patterns=patterns, cap="Moderate",
+            cap_reason="input is a per-session average; Strong needs per-input timing, which the session log does not contain",
+        )
 
         if not reliable:
             confidence, basis = "Insufficient", f"only {facts['session_count']} sessions; variability is not reliable below {SETTINGS['sessions_for_reliable_variability']}"
@@ -1051,29 +1153,37 @@ def account_hypotheses(facts, connections, observations, percentiles):
                 "next_check": "Check the game-level monitor's alert for this window.",
             })
 
+        # Only terminations outside game-wide spikes count towards cheating.
         outside = facts["terminations"] - elevated
         outside_rate = outside / facts["session_count"]
 
         if outside >= SETTINGS["cheating_min_terminations"] and outside_rate >= SETTINGS["cheating_min_rate"]:
-            concentrated = len(facts["terminated_games"]) <= 2
             high = percentiles.get("termination_rate", {}).get("percentile")
+
+            # Further patterns beyond the trigger. Repeated, high-rate
+            # terminations are what cheating produces, but repeated false
+            # positives produce them too, so they support without contradicting.
+            patterns = []
+
+            if outside_rate >= SETTINGS["cheating_high_rate"]:
+                patterns.append(f"termination rate {outside_rate:.0%} outside spikes")
+
+            if facts["termination_days_outside_spikes"] >= SETTINGS["cheating_min_days"]:
+                patterns.append(f"terminations on {facts['termination_days_outside_spikes']} separate days")
 
             alternatives = [
                 {
                     "explanation": "Anti-cheat false positives hitting an honest player repeatedly.",
-                    "check": "Terminations are concentrated on one or two games (false positives tend to follow whatever the player plays)",
-                    "result": "contradicted" if concentrated else "not contradicted",
-                    "observed": f"terminations on: {game_names}",
-                },
-                {
-                    "explanation": "A game-wide fault or incident.",
-                    "check": "Terminations happened outside elevated game-wide periods",
-                    "result": "contradicted",
-                    "observed": f"{outside} of {facts['terminations']} terminations outside elevated periods",
+                    "check": "Session data alone cannot rule this out; repeated, high-rate terminations are consistent with both",
+                    "result": "not contradicted",
+                    "observed": f"{outside} terminations outside spikes on {facts['termination_days_outside_spikes']} days, on: {game_names}",
                 },
             ]
 
-            confidence, basis = judge(alternatives)
+            confidence, basis = judge(
+                alternatives, patterns=patterns, cap="Moderate",
+                cap_reason="Strong needs the anti-cheat detection details, which the session log does not contain",
+            )
 
             hypotheses.append({
                 "name": "Cheating",
@@ -1104,7 +1214,7 @@ def account_hypotheses(facts, connections, observations, percentiles):
                 f"Few other links fit a dormitory, office, café, carrier-grade NAT, or a VPN exit."
             ),
             "families": ["entity_graph"],
-            "supporting_observations": [],
+            "supporting_observations": [item for item in [find_observation(observations, "shared_client_ip")] if item],
             "common_cause_alternative": "Not applicable: this is itself the innocent explanation for a shared IP.",
             "alternatives": [{
                 "explanation": "A ring of accounts behind one address.",
@@ -1180,7 +1290,7 @@ def entity_hypotheses(summary):
             creation_check,
         ]
 
-    confidence, basis = judge(alternatives)
+    confidence, basis = judge(alternatives, patterns=[f"{accounts} accounts on one {name}"])
 
     hypotheses = [{
         "name": "Coordinated accounts",
