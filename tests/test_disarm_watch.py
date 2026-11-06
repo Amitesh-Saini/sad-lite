@@ -191,7 +191,9 @@ def test_grouping_is_by_app_id_not_display_name():
 
 def test_games_without_configuration_are_reported_as_unmonitored():
     text = CONFIG_BYTES.decode("utf-8")
-    block = '  - app_id: "app_1012"\n    name: "Molten Yard"\n    enforcement_enabled: true\n'
+    # No trailing newline in the block: the last game may end the file without one.
+    block = '  - app_id: "app_1012"\n    name: "Molten Yard"\n    enforcement_enabled: true'
+    assert text.count(block) == 1, "fixture text not found in config/games.yaml"
     report = scan_of(_incident_dir, text.replace(block, "").encode("utf-8"))
 
     assert report["unmonitored_app_ids"] == ["app_1012"]

@@ -481,9 +481,13 @@ def render_markdown(trace):
     for call in decisions["tool_calls"]:
         arguments = call.get("validated_arguments", call["requested_arguments"])
         outcome = call["result"] if call["outcome"] == "ok" else f"**refused**: {call['reason']}"
-        # Refused calls can carry caller-supplied text, so every cell is made inert.
-        lines.append(f"| {call['call']} | {as_inert(call['tool'])} | {as_inert(json.dumps(arguments, sort_keys=True))} | "
-                     f"{as_inert(outcome) if call['outcome'] == 'refused' else outcome} |")
+        if call["outcome"] == "ok":
+            # Accepted calls: a known tool name and arguments that passed format validation.
+            lines.append(f"| {call['call']} | `{call['tool']}` | `{json.dumps(arguments, sort_keys=True)}` | {outcome} |")
+        else:
+            # Refused calls can carry caller-supplied text, so every cell is made inert.
+            lines.append(f"| {call['call']} | {as_inert(call['tool'])} | {as_inert(json.dumps(arguments, sort_keys=True))} | "
+                         f"{as_inert(outcome)} |")
 
     for proposal in decisions["proposals"]:
         peak = proposal["evidence"]["peak_window"]
