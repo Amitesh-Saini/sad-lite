@@ -6,3 +6,6 @@ __pycache__/
 .env
 data/
 reports/
+
+# Local enforcement decisions and evidence bundles (generated)
+enforcement/
