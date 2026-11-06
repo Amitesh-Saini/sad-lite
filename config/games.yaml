@@ -1,0 +1,97 @@
+# =============================================================================
+# SAD-Lite — Game Monitoring Configuration
+# =============================================================================
+#
+# Read by disarm_watch.py through game_config.py, which rejects repeated keys,
+# booleans other than true/false, anchors and aliases, unknown settings,
+# invalid types, negative counts, and rates outside [0, 1].
+#
+# enforcement_enabled is SIMULATED configuration. Setting it to false does
+# not disable a real game and does not undo any account ban.
+#
+# The only automated change ever made to this file is a disarm proposal: one
+# game's enforcement_enabled from true to false, on one line, reviewed in a
+# merge request. Re-enabling is a manual edit. Thresholds are never changed
+# by a proposal, and games are never added by one.
+#
+# Every game uses the shared defaults. A per-game override needs both an
+# overrides mapping and a written override_reason, and should be added only
+# when calibration shows a concrete need.
+#
+# Layout rule for the disarm edit: one game per list entry, one setting per
+# line, no inline mappings.
+# =============================================================================
+
+version: 1
+
+defaults:
+  # Chosen by stated reasoning (see calibrate_games.py).
+  window_hours: 6
+  check_interval_hours: 1
+  baseline_lookback_hours: 168
+  min_sessions: 20
+  min_terminations: 10
+  min_baseline_sessions: 100
+  baseline_multiplier: 5.0
+  # Calibrated on incident-free data (see the calibration block below).
+  termination_rate_threshold: 0.15
+  baseline_floor_rate: 0.0132
+
+calibration:
+  data: "Generator seeds 101-105 with the injected incident disabled; used nowhere else."
+  floor_rule: "Median observed baseline rate across 41,728 calibration windows with a sufficient baseline."
+  threshold_rule: "Lowest value on the grid 0.05-0.60 (step 0.05) whose false alert episodes stay within budget."
+  budget: "At most one alert episode per 30 days across all games: 5 across the 5 seeds."
+  result: "0.15 gave 3 false episodes, all on the first day before 100 baseline sessions existed (insufficient baseline, so no disarm proposal); 0.10 gave 8."
+  held_out_check: "Seeds 42, 1, 7: incident detected at all three, proposal-eligible; no proposal-eligible alert outside the incident, with or without it."
+  limits: "Behaviour on SAD-Lite's own generator only, not on real traffic."
+  record: "reports/calibration/20261106_123409_UTC/calibration.json"
+
+games:
+  - app_id: "app_1001"
+    name: "Neon Drift"
+    enforcement_enabled: true
+
+  - app_id: "app_1002"
+    name: "Harbour Siege"
+    enforcement_enabled: true
+
+  - app_id: "app_1003"
+    name: "Pale Orbit"
+    enforcement_enabled: true
+
+  - app_id: "app_1004"
+    name: "Kettle Creek"
+    enforcement_enabled: true
+
+  - app_id: "app_1005"
+    name: "Vanta Rally"
+    enforcement_enabled: true
+
+  - app_id: "app_1006"
+    name: "Ironwood"
+    enforcement_enabled: true
+
+  - app_id: "app_1007"
+    name: "Ledger of Ash"
+    enforcement_enabled: true
+
+  - app_id: "app_1008"
+    name: "Sunken Atlas"
+    enforcement_enabled: true
+
+  - app_id: "app_1009"
+    name: "Quiet Machines"
+    enforcement_enabled: true
+
+  - app_id: "app_1010"
+    name: "Third Harvest"
+    enforcement_enabled: true
+
+  - app_id: "app_1011"
+    name: "Salt & Signal"
+    enforcement_enabled: true
+
+  - app_id: "app_1012"
+    name: "Molten Yard"
+    enforcement_enabled: true
