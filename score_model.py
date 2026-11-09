@@ -50,8 +50,6 @@ model's ranking with the known labels and our rule-based results.
 An unusual account is not necessarily abusive. Scores are review
 priorities, not probabilities or automatic punishment decisions.
 
-Sources: the feature selection follows the SAD-Lite reference
-implementation (sadlite/score_model.py), without its standardisation step.
 """
 
 import argparse

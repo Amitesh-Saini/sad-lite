@@ -34,7 +34,7 @@ import investigate  # noqa: E402
 def measure(seed, per_group):
     """Investigate a sample of each group and count the strongest confidence per hypothesis."""
 
-    sessions, labels, _ = generate_users.build_dataset(seed=seed)
+    sessions, labels, _ = generate_users.build_dataset(seed=seed) # Call Generate Users
     raw = pd.DataFrame(sessions).astype(str)
     labels = pd.DataFrame(labels)
 
@@ -42,7 +42,7 @@ def measure(seed, per_group):
     counts = defaultdict(Counter)
 
     for pattern, group in labels.groupby("pattern", sort=True):
-        for account in sorted(group["user_id"])[:per_group]:
+        for account in sorted(group["user_id"])[:per_group]: # Top 20 accounts after sort - Deterministic not random
             report = investigate.investigate(inputs, "user_id", account)
 
             for hypothesis in report["hypotheses"]:

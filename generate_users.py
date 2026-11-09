@@ -98,11 +98,6 @@
 # Each stage has a manifest.json recording file hashes, the seed, software
 # versions, and the hash of this script.
 #
-# SOURCES
-# Cohort sizes and most behaviour parameters follow the SAD-Lite reference
-# implementation (sadlite/generate_sessions.py). Departures from it are marked
-# "Differs from the reference" where they occur. The innocent lookalikes are
-# not in the reference; their design and fractions are this project's own.
 # =============================================================================
 
 
@@ -535,8 +530,7 @@ def make_bot_user(user_number, rng, simulation_start, used_ids, days=30):
                 rng=rng,
             ))
 
-    # Differs from the reference: a session that would overlap the next one,
-    # across a day boundary, is moved to start after it ends.
+
     return remove_overlaps(sessions, rng, simulation_end)
 
 
@@ -573,8 +567,7 @@ def account_sharing_users(user_number, rng, simulation_start, used_ids, days=30)
     # The renters' setups after the account changes hands.
     renter_countries = rng.sample(COUNTRIES, k=4)
 
-    # Differs from the reference: each renter IP belongs to one country,
-    # so a country change always comes with an IP change.
+
     renter_ips = [
         {"client_ip": new_ip(rng, used_ids), "country": renter_countries[index % 4]}
         for index in range(9)
@@ -806,8 +799,7 @@ def make_shared_network_users(user_numbers, rng, simulation_start, used_ids, day
     # One address and one location for the whole dormitory.
     shared_ip = new_ip(rng, used_ids)
 
-    # Differs from the reference: every dorm user shares one country,
-    # because they sit behind one network address.
+    
     country = rng.choice(COUNTRIES)
 
     sessions = []
@@ -1167,8 +1159,7 @@ def inject_game_incident(sessions, labels, rng, incident_start, used_ids,
         if session["user_id"] in normal_users:
             sessions_by_user.setdefault(session["user_id"], []).append(session)
 
-    # Differs from the reference: participants are drawn without replacement,
-    # so each has exactly one incident session.
+    
     candidates = sorted(sessions_by_user)
     rng.shuffle(candidates)
 
@@ -1181,8 +1172,7 @@ def inject_game_incident(sessions, labels, rng, incident_start, used_ids,
 
         user_sessions = sessions_by_user[user_id]
 
-        # Differs from the reference: the participant's usual device, IP,
-        # country, and payment identifier are reused, not replaced.
+        
         template = rng.choice(user_sessions)
 
         duration_min = clip(rng.gauss(12, 6), 2.0, 60.0)

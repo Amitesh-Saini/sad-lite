@@ -40,11 +40,6 @@
 #
 # Initial thresholds are synthetic-project assumptions, not production rules.
 # Equal scores use a deterministic hash tie-break, not account-number order.
-#
-# SOURCES
-# The rule set, weights, triggers, and saturation points follow the SAD-Lite
-# reference configuration (config/detection.yaml). Entity-graph triggers are
-# one lower than the reference because our counts exclude the account itself.
 # =============================================================================
 
 import argparse

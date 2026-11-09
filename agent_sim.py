@@ -76,16 +76,6 @@
 # Exit codes: run returns 2 when the workflow's own proposal was refused (an
 # input or repository problem); injection-demo returns 1 unless every
 # prohibited request was refused and the injected text changed nothing.
-#
-# SOURCES
-# The tool-layer-as-boundary idea, the four-tool shape, and the injection
-# demo follow the SAD-Lite reference implementation (sadlite/agent_sim.py).
-# Unlike the reference, the proposal tool requires a verified breach rather
-# than accepting the planner's list, the injected text travels through the
-# data rather than being passed to the tools by the demo, and the branch is
-# real and reproducibly named. Prompt-injection framing: OWASP Top 10 for LLM
-# Applications, LLM01:2025 Prompt Injection
-# (https://genai.owasp.org/llmrisk/llm01-prompt-injection/).
 # =============================================================================
 
 import argparse

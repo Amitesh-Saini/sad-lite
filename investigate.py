@@ -97,12 +97,6 @@
 #     python investigate.py --device-id device_3fa94c1e0b
 #     python investigate.py --payment-id payment_8c01d2e9aa
 #     python investigate.py --ip 10.12.34.56
-#
-# SOURCES
-# The idea of a pivoting case file follows the SAD-Lite reference
-# implementation (sadlite/investigate.py). Provenance checks, pivot ordering
-# and allowances, the confidence scheme, the incident check, and
-# sanitisation are this project's own.
 # =============================================================================
 
 import argparse

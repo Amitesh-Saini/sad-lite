@@ -69,13 +69,6 @@
 #     python disarm_watch.py scan
 #     python disarm_watch.py propose --report reports/disarm/<scan>/alerts.json --alert-id alert_...
 #     python disarm_watch.py propose ... --apply
-#
-# SOURCES
-# The rolling-window watcher, the three-part alert condition, and the
-# branch-plus-merge-request idea follow the SAD-Lite reference implementation
-# (sadlite/disarm_watch.py). Evaluating every window, the baseline rules,
-# calibrated thresholds, scan regeneration, the single-flag proof, and the
-# plumbing-only commit are this project's own.
 # =============================================================================
 
 import argparse

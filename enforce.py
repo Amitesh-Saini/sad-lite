@@ -18,7 +18,7 @@
 #
 # IDENTITY
 # An account is identified by (dataset_id, user_id). The dataset_id is the
-# SHA-256 of the session data, because the same user ID names different
+# SHA-256 of the session data, because the same u.ser ID names different
 # synthetic people in different datasets.
 #
 # WHAT A BAN REQUIRES
@@ -95,12 +95,6 @@
 #         --reviewer "..." --notes "..." --request-key <key> --apply
 #     python enforce.py status --dataset-id <sha256> --user-id user_00042
 #     python enforce.py verify
-#
-# SOURCES
-# Reason codes, dry-run default, and reversible records follow the SAD-Lite
-# reference implementation (sadlite/enforce.py). Report regeneration, the
-# evidence policy, request keys, the hash-chained log and its recovery rules,
-# and evidence bundles are this project's own.
 # =============================================================================
 
 import argparse
